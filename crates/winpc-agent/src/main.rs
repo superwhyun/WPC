@@ -1,4 +1,7 @@
 #[cfg(windows)]
+mod command_pipe;
+
+#[cfg(windows)]
 mod windows_app {
     use std::{
         ffi::c_void,
@@ -197,6 +200,7 @@ mod windows_app {
 
         let state = Arc::new(Mutex::new(initial_state));
         let _ = UI_STATE.set(state.clone());
+        crate::command_pipe::spawn_command_server_thread();
         spawn_polling_thread(state);
         run_message_loop()?;
 

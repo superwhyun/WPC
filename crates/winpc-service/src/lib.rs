@@ -126,7 +126,10 @@ async fn supervisor_loop(state: SharedState) {
 async fn index() -> impl IntoResponse {
     (
         [
-            (CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate")),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+            ),
             (PRAGMA, HeaderValue::from_static("no-cache")),
         ],
         Html(html::INDEX_HTML),
@@ -216,21 +219,16 @@ async fn snapshot(
     headers: HeaderMap,
 ) -> std::result::Result<Response, HttpError> {
     authorize_control(&state, &headers).await?;
-    let snapshot_path = state
-        .config_path()
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("latest-snapshot.jpg");
-    let expected_sid = state.current_config().await.protected_user_sid;
-    let bytes = tokio::task::spawn_blocking(move || {
-        platform::capture_active_console_snapshot(expected_sid.as_deref(), &snapshot_path)
-    })
-    .await
-    .map_err(|error| HttpError::internal(error.to_string()))?
-    .map_err(|error| HttpError::internal(error.to_string()))?;
+    let bytes = platform::capture_snapshot().await?;
 
     Ok((
-        [(CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("image/png")),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+            ),
+        ],
         Body::from(bytes),
     )
         .into_response())
@@ -323,7 +321,9 @@ impl From<Error> for HttpError {
         let status = match value {
             Error::InvalidPin | Error::InvalidSessionToken => StatusCode::UNAUTHORIZED,
             Error::InvalidDuration => StatusCode::BAD_REQUEST,
-            Error::ConfigIncomplete(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::ConfigIncomplete(_) | Error::SnapshotUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -457,10 +457,35 @@ mod tests {
 
     #[test]
     fn duration_parser_accepts_json_and_form_shapes() {
-        assert_eq!(parse_duration_minutes(br#"{"durationMinutes":30}"#).unwrap(), 30);
+        assert_eq!(
+            parse_duration_minutes(br#"{"durationMinutes":30}"#).unwrap(),
+            30
+        );
         assert_eq!(parse_duration_minutes(br#""45""#).unwrap(), 45);
         assert_eq!(parse_duration_minutes(br#"15"#).unwrap(), 15);
         assert_eq!(parse_duration_minutes(b"durationMinutes=20").unwrap(), 20);
         assert_eq!(parse_duration_minutes(b"").unwrap(), 30);
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_session_token() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = SharedState::load(tempdir.path().join("config.json"))
+            .await
+            .unwrap();
+
+        state.replace_config(AppConfig::default()).await.unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/device/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

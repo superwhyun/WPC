@@ -60,3 +60,18 @@ pub enum IpcResponse {
     Ack(DeviceStatus),
     Error { message: String },
 }
+
+pub const AGENT_COMMAND_PIPE_NAME: &str = r"\\.\pipe\WinParentalControlAgentCommands";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentCommandRequest {
+    CaptureSnapshot,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentCommandResponse {
+    Snapshot { png_base64: String },
+    Error { message: String },
+}

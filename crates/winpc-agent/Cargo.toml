@@ -5,7 +5,9 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
+png = "0.17.16"
 serde_json.workspace = true
 tokio.workspace = true
 winpc-core = { path = "../winpc-core" }

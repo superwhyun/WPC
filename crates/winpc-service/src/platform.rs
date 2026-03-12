@@ -2,19 +2,23 @@
 mod imp {
     use std::{
         ffi::OsStr,
-        fs,
         os::windows::ffi::OsStrExt,
         path::{Path, PathBuf},
         sync::mpsc,
     };
 
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use chrono::Utc;
     use tokio::runtime::Builder;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::windows::named_pipe::ClientOptions,
+    };
     use tracing::{error, info};
     use windows::{
         core::{PCWSTR, PWSTR},
         Win32::{
-            Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+            Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
             Security::{
                 Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser,
                 TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
@@ -25,8 +29,8 @@ mod imp {
                 },
                 Threading::{
                     CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId,
-                    GetExitCodeProcess, OpenProcessToken, WaitForSingleObject,
-                    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW, INFINITE,
+                    GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
+                    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
                 },
             },
         },
@@ -39,6 +43,9 @@ mod imp {
         },
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
+    };
+    use winpc_core::{
+        AgentCommandRequest, AgentCommandResponse, Error, Result, AGENT_COMMAND_PIPE_NAME,
     };
 
     use crate::state::SharedState;
@@ -85,17 +92,9 @@ mod imp {
 
     pub fn lock_active_console(expected_sid: Option<&str>) -> std::io::Result<()> {
         let rundll32 = system_path("rundll32.exe");
-        let command_line = format!(
-            "\"{}\" user32.dll,LockWorkStation",
-            rundll32.display()
-        );
+        let command_line = format!("\"{}\" user32.dll,LockWorkStation", rundll32.display());
         let can_fallback = can_run_in_current_process(expected_sid).unwrap_or(false);
-        match run_in_active_console_session(
-            expected_sid,
-            &rundll32,
-            &command_line,
-            false,
-        ) {
+        match run_in_active_console_session(expected_sid, &rundll32, &command_line, false) {
             Ok(()) => {}
             Err(error) if can_fallback => {
                 std::process::Command::new(&rundll32)
@@ -113,57 +112,6 @@ mod imp {
             .args(["/s", "/t", "0", "/f"])
             .spawn()?;
         Ok(())
-    }
-
-    pub fn capture_active_console_snapshot(
-        expected_sid: Option<&str>,
-        output_path: &Path,
-    ) -> std::io::Result<Vec<u8>> {
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if output_path.exists() {
-            let _ = fs::remove_file(output_path);
-        }
-
-        let script_path = output_path.with_extension("ps1");
-        fs::write(&script_path, snapshot_script(output_path))?;
-
-        let powershell = system_path("WindowsPowerShell\\v1.0\\powershell.exe");
-        let command_line = format!(
-            "\"{}\" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{}\"",
-            powershell.display(),
-            script_path.display()
-        );
-        let can_fallback = can_run_in_current_process(expected_sid).unwrap_or(false);
-
-        match run_in_active_console_session(expected_sid, &powershell, &command_line, true) {
-            Ok(()) => {}
-            Err(error) if can_fallback => {
-                let status = std::process::Command::new(&powershell)
-                    .args([
-                        "-NoProfile",
-                        "-WindowStyle",
-                        "Hidden",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                    ])
-                    .arg(&script_path)
-                    .status()?;
-                if !status.success() {
-                    return Err(std::io::Error::other(format!(
-                        "snapshot helper exited with status {status}"
-                    )));
-                }
-                info!("fell back to current-process snapshot capture: {error}");
-            }
-            Err(error) => return Err(error),
-        }
-
-        let bytes = fs::read(output_path)?;
-        let _ = fs::remove_file(&script_path);
-        Ok(bytes)
     }
 
     fn block_on_console() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -254,6 +202,42 @@ mod imp {
     fn current_agent_path() -> std::io::Result<PathBuf> {
         let current = std::env::current_exe()?;
         Ok(current.with_file_name("winpc-agent.exe"))
+    }
+
+    pub async fn capture_snapshot() -> Result<Vec<u8>> {
+        let mut client = ClientOptions::new()
+            .open(AGENT_COMMAND_PIPE_NAME)
+            .map_err(|error| Error::SnapshotUnavailable(error.to_string()))?;
+        let payload = format!(
+            "{}\n",
+            serde_json::to_string(&AgentCommandRequest::CaptureSnapshot)
+                .map_err(|error| Error::SnapshotUnavailable(error.to_string()))?
+        );
+        client
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|error| Error::SnapshotUnavailable(error.to_string()))?;
+        client
+            .flush()
+            .await
+            .map_err(|error| Error::SnapshotUnavailable(error.to_string()))?;
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| Error::SnapshotUnavailable(error.to_string()))?;
+
+        let response: AgentCommandResponse = serde_json::from_str(&line)
+            .map_err(|error| Error::SnapshotUnavailable(error.to_string()))?;
+
+        match response {
+            AgentCommandResponse::Snapshot { png_base64 } => STANDARD
+                .decode(png_base64)
+                .map_err(|error| Error::SnapshotUnavailable(error.to_string())),
+            AgentCommandResponse::Error { message } => Err(Error::SnapshotUnavailable(message)),
+        }
     }
 
     fn active_console_user_sid() -> std::io::Result<Option<String>> {
@@ -422,26 +406,6 @@ mod imp {
         Ok(())
     }
 
-    fn snapshot_script(output_path: &Path) -> String {
-        let output = output_path.display().to_string().replace('\'', "''");
-        format!(
-            r#"$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Windows.Forms
-$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size)
-$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object {{ $_.MimeType -eq 'image/jpeg' }} | Select-Object -First 1
-$params = New-Object System.Drawing.Imaging.EncoderParameters 1
-$params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 80L)
-$bitmap.Save('{output}', $codec, $params)
-$graphics.Dispose()
-$bitmap.Dispose()
-"#
-        )
-    }
-
     fn system_path(relative: &str) -> PathBuf {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
         PathBuf::from(root).join("System32").join(relative)
@@ -454,7 +418,7 @@ $bitmap.Dispose()
 
 #[cfg(not(windows))]
 mod imp {
-    use std::path::Path;
+    use winpc_core::{Error, Result};
 
     use crate::state::SharedState;
 
@@ -474,22 +438,22 @@ mod imp {
     }
 
     pub fn lock_active_console(_expected_sid: Option<&str>) -> std::io::Result<()> {
-        Err(std::io::Error::other("windows lock is only supported on Windows"))
+        Err(std::io::Error::other(
+            "windows lock is only supported on Windows",
+        ))
     }
 
     pub fn shutdown_machine() -> std::io::Result<()> {
-        Err(std::io::Error::other("shutdown is only supported on Windows"))
+        Err(std::io::Error::other(
+            "shutdown is only supported on Windows",
+        ))
     }
 
-    pub fn capture_active_console_snapshot(
-        _expected_sid: Option<&str>,
-        _output_path: &Path,
-    ) -> std::io::Result<Vec<u8>> {
-        Err(std::io::Error::other("snapshot capture is only supported on Windows"))
+    pub async fn capture_snapshot() -> Result<Vec<u8>> {
+        Err(Error::SnapshotUnavailable(
+            "snapshot is only available on Windows".to_string(),
+        ))
     }
 }
 
-pub use imp::{
-    capture_active_console_snapshot, lock_active_console, run, shutdown_machine,
-    supervisor_tick,
-};
+pub use imp::{capture_snapshot, lock_active_console, run, shutdown_machine, supervisor_tick};

@@ -16,6 +16,8 @@ pub enum Error {
     InvalidDuration,
     #[error("session token is missing or invalid")]
     InvalidSessionToken,
+    #[error("snapshot is unavailable: {0}")]
+    SnapshotUnavailable(String),
     #[error("failed to parse integer: {0}")]
     ParseInt(#[from] ParseIntError),
     #[error("sensitive data decryption failed")]
