@@ -14,7 +14,7 @@ mod imp {
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::windows::named_pipe::ClientOptions,
     };
-    use tracing::{error, info};
+    use tracing::{error, info, warn};
     use windows::{
         core::{PCWSTR, PWSTR},
         Win32::{
@@ -73,18 +73,26 @@ mod imp {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config = state.current_config().await;
         let protected_sid = config.protected_user_sid.clone();
+        let active_console_sid = if is_console_mode() {
+            current_process_user_sid().map(Some)?
+        } else {
+            active_console_user_sid()?
+        };
         let is_logged_in = match protected_sid.as_deref() {
-            Some(sid) => active_console_matches_sid(sid)?,
-            None => false,
+            Some(sid) => active_console_sid.as_deref() == Some(sid),
+            None => active_console_sid.is_some(),
         };
 
         state.set_protected_user_logged_in(is_logged_in).await;
         let status = state.mark_agent_unhealthy_if_needed().await;
         if is_logged_in && !status.agent_healthy && state.should_retry_agent_spawn(Utc::now()).await
         {
-            if let Some(sid) = protected_sid.as_deref() {
-                spawn_agent_for_active_console_user(sid)?;
-            }
+            warn!(
+                active_console_sid = ?active_console_sid,
+                protected_sid = ?protected_sid,
+                "agent is unhealthy; attempting to launch winpc-agent"
+            );
+            spawn_agent_for_active_console_user(protected_sid.as_deref())?;
         }
 
         Ok(())
@@ -191,12 +199,49 @@ mod imp {
         }
     }
 
-    fn spawn_agent_for_active_console_user(expected_sid: &str) -> std::io::Result<()> {
+    fn spawn_agent_for_active_console_user(expected_sid: Option<&str>) -> std::io::Result<()> {
         let agent_path = current_agent_path()?;
         let command_line = format!("\"{}\"", agent_path.display());
-        run_in_active_console_session(Some(expected_sid), &agent_path, &command_line, false)?;
-        info!("spawned winpc-agent for active console session");
+        if is_console_mode() {
+            if let Some(expected_sid) = expected_sid {
+                let current_sid = current_process_user_sid()?;
+                if current_sid != expected_sid {
+                    return Err(std::io::Error::other(
+                        "current console user does not match the protected user",
+                    ));
+                }
+            }
+            warn!(
+                agent_path = %agent_path.display(),
+                expected_sid = ?expected_sid,
+                "launching winpc-agent directly in the current console session"
+            );
+            std::process::Command::new(&agent_path).spawn()?;
+            warn!("spawned winpc-agent in current console session");
+            return Ok(());
+        }
+
+        let can_fallback = can_run_in_current_process(expected_sid).unwrap_or(false);
+        warn!(
+            agent_path = %agent_path.display(),
+            expected_sid = ?expected_sid,
+            can_fallback,
+            "launching winpc-agent"
+        );
+        match run_in_active_console_session(expected_sid, &agent_path, &command_line, false) {
+            Ok(()) => {}
+            Err(error) if can_fallback => {
+                std::process::Command::new(&agent_path).spawn()?;
+                info!("fell back to current-process agent launch: {error}");
+            }
+            Err(error) => return Err(error),
+        }
+        warn!("spawned winpc-agent for active console session");
         Ok(())
+    }
+
+    fn is_console_mode() -> bool {
+        std::env::args().any(|arg| arg == "--console")
     }
 
     fn current_agent_path() -> std::io::Result<PathBuf> {
@@ -249,6 +294,14 @@ mod imp {
         let mut token = HANDLE::default();
         let result = unsafe { WTSQueryUserToken(session_id, &mut token) };
         if let Err(error) = result {
+            if current_process_is_active_console_session()? {
+                info!(
+                    "falling back to current-process SID for active console detection: {}",
+                    error
+                );
+                return current_process_user_sid().map(Some);
+            }
+
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 error.to_string(),

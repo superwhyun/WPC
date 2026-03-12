@@ -28,7 +28,8 @@ if ($existing) {
 
 sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= "WinParentalControl Service" | Out-Null
 sc.exe description $ServiceName "Parental control service for lock, unlock and session timing." | Out-Null
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000 | Out-Null
+sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/15000/restart/30000 | Out-Null
+sc.exe failureflag $ServiceName 1 | Out-Null
 
 Start-Service -Name $ServiceName
 Write-Host "Service installed and started: $ServiceName"

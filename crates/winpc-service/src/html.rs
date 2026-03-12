@@ -171,6 +171,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <button type="button" class="danger" id="lock">Lock now</button>
         <button type="button" class="secondary" id="windows-lock">Windows lock</button>
         <button type="button" class="danger" id="shutdown">Shut down</button>
+        <button type="button" class="danger" id="stop-service">Stop service</button>
       </div>
       <div class="message" id="message"></div>
     </section>
@@ -347,6 +348,21 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         await ensureAuth();
         await request("/api/device/shutdown", { method: "POST" });
         setMessage("Shutdown requested.");
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
+
+    document.getElementById("stop-service").addEventListener("click", async () => {
+      const pin = window.prompt("Parent PIN required to stop the service.");
+      if (pin === null) return;
+      try {
+        await request("/api/service/stop", {
+          method: "POST",
+          body: JSON.stringify({ pin }),
+        });
+        token = null;
+        setMessage("Service stop requested.");
       } catch (error) {
         setMessage(error.message, true);
       }

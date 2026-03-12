@@ -19,6 +19,7 @@ use axum::{
 };
 use chrono::Utc;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
 use winpc_core::{
@@ -30,6 +31,36 @@ use crate::{ipc::run_ipc_server, state::SharedState};
 
 const LISTEN_ADDR: &str = "127.0.0.1:46391";
 const SESSION_TTL_MINUTES: i64 = 10;
+
+#[derive(Clone)]
+struct ShutdownHandle {
+    sender: watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    fn new() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
+
+    fn request_shutdown(&self) {
+        let _ = self.sender.send(true);
+    }
+
+    async fn wait_for_shutdown(&self) {
+        let mut receiver = self.sender.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = receiver.changed().await;
+    }
+}
+
+#[derive(Clone)]
+struct AppContext {
+    state: SharedState,
+    shutdown: ShutdownHandle,
+}
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -65,24 +96,31 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let state = SharedState::load(config_path).await?;
+    let shutdown_handle = ShutdownHandle::new();
     let supervisor = tokio::spawn(supervisor_loop(state.clone()));
-    let ipc = tokio::spawn(run_ipc_server(state.clone()));
-    let http = tokio::spawn(run_http_server(state, shutdown));
+    let mut ipc = tokio::spawn(run_ipc_server(state.clone()));
+    let mut http = tokio::spawn(run_http_server(state, shutdown, shutdown_handle));
 
     tokio::select! {
-        result = http => {
+        result = &mut http => {
             result??;
         }
-        result = ipc => {
+        result = &mut ipc => {
             result??;
         }
-    }
+    };
 
     supervisor.abort();
+    ipc.abort();
+    http.abort();
     Ok(())
 }
 
 pub fn build_router(state: SharedState) -> Router {
+    build_router_with_shutdown(state, ShutdownHandle::new())
+}
+
+fn build_router_with_shutdown(state: SharedState, shutdown_handle: ShutdownHandle) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -94,22 +132,32 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/device/windows-lock", post(windows_lock))
         .route("/api/device/shutdown", post(shutdown))
         .route("/api/device/snapshot", get(snapshot))
-        .with_state(state)
+        .route("/api/service/stop", post(stop_service))
+        .with_state(AppContext {
+            state,
+            shutdown: shutdown_handle,
+        })
 }
 
 async fn run_http_server<S>(
     state: SharedState,
     shutdown: S,
+    internal_shutdown: ShutdownHandle,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: Future<Output = ()> + Send + 'static,
 {
-    let app = build_router(state);
+    let app = build_router_with_shutdown(state, internal_shutdown.clone());
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     let local_addr = listener.local_addr()?;
     info!("HTTP control plane listening on {local_addr}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown => {}
+                _ = internal_shutdown.wait_for_shutdown() => {}
+            }
+        })
         .await?;
     Ok(())
 }
@@ -141,19 +189,21 @@ async fn healthz() -> &'static str {
 }
 
 async fn get_status(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
 ) -> std::result::Result<Json<DeviceStatus>, HttpError> {
-    Ok(Json(state.device_status().await))
+    Ok(Json(app.state.device_status().await))
 }
 
 async fn auth_pin(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     Json(payload): Json<AuthPinRequest>,
 ) -> std::result::Result<Json<AuthPinResponse>, HttpError> {
-    state.verify_pin(&payload.pin).await?;
+    app.state.verify_pin(&payload.pin).await?;
     let expires_at_utc = Utc::now() + chrono::Duration::minutes(SESSION_TTL_MINUTES);
     let token = Uuid::new_v4().to_string();
-    state.record_session(token.clone(), expires_at_utc).await;
+    app.state
+        .record_session(token.clone(), expires_at_utc)
+        .await;
     Ok(Json(AuthPinResponse {
         token,
         expires_at_utc,
@@ -161,40 +211,40 @@ async fn auth_pin(
 }
 
 async fn unlock(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
-    authorize_control(&state, &headers).await?;
-    let status = state.unlock(parse_duration_minutes(&body)?).await?;
+    authorize_control(&app.state, &headers).await?;
+    let status = app.state.unlock(parse_duration_minutes(&body)?).await?;
     Ok(Json(LockActionResponse { status }))
 }
 
 async fn extend(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
-    authorize_control(&state, &headers).await?;
-    let status = state.extend(parse_duration_minutes(&body)?).await?;
+    authorize_control(&app.state, &headers).await?;
+    let status = app.state.extend(parse_duration_minutes(&body)?).await?;
     Ok(Json(LockActionResponse { status }))
 }
 
 async fn lock(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
-    authorize_control(&state, &headers).await?;
-    let status = state.lock().await?;
+    authorize_control(&app.state, &headers).await?;
+    let status = app.state.lock().await?;
     Ok(Json(LockActionResponse { status }))
 }
 
 async fn windows_lock(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, HttpError> {
-    authorize_control(&state, &headers).await?;
-    let expected_sid = state.current_config().await.protected_user_sid;
+    authorize_control(&app.state, &headers).await?;
+    let expected_sid = app.state.current_config().await.protected_user_sid;
     tokio::task::spawn_blocking(move || platform::lock_active_console(expected_sid.as_deref()))
         .await
         .map_err(|error| HttpError::internal(error.to_string()))?
@@ -203,10 +253,10 @@ async fn windows_lock(
 }
 
 async fn shutdown(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, HttpError> {
-    authorize_control(&state, &headers).await?;
+    authorize_control(&app.state, &headers).await?;
     tokio::task::spawn_blocking(platform::shutdown_machine)
         .await
         .map_err(|error| HttpError::internal(error.to_string()))?
@@ -215,10 +265,10 @@ async fn shutdown(
 }
 
 async fn snapshot(
-    State(state): State<SharedState>,
+    State(app): State<AppContext>,
     headers: HeaderMap,
 ) -> std::result::Result<Response, HttpError> {
-    authorize_control(&state, &headers).await?;
+    authorize_control(&app.state, &headers).await?;
     let bytes = platform::capture_snapshot().await?;
 
     Ok((
@@ -232,6 +282,19 @@ async fn snapshot(
         Body::from(bytes),
     )
         .into_response())
+}
+
+async fn stop_service(
+    State(app): State<AppContext>,
+    Json(payload): Json<AuthPinRequest>,
+) -> std::result::Result<Json<serde_json::Value>, HttpError> {
+    app.state.verify_pin(&payload.pin).await?;
+    let shutdown = app.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        shutdown.request_shutdown();
+    });
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn authorize_control(
@@ -353,6 +416,7 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
     let mut config_path =
         std::env::var_os("WINPC_CONFIG_PATH").map_or_else(default_config_path, Into::into);
     let mut protected_user_sid = None;
+    let mut all_users = false;
     let mut pin = None;
     let mut warn_only = None;
 
@@ -367,6 +431,9 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
                     args.next()
                         .ok_or("missing value for --protected-user-sid")?,
                 );
+            }
+            "--all-users" => {
+                all_users = true;
             }
             "--pin" => {
                 pin = Some(args.next().ok_or("missing value for --pin")?);
@@ -384,7 +451,9 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
     }
 
     let mut config = AppConfig::load(&config_path)?;
-    if let Some(sid) = protected_user_sid {
+    if all_users {
+        config.protected_user_sid = None;
+    } else if let Some(sid) = protected_user_sid {
         config.protected_user_sid = Some(sid);
     }
     if let Some(pin) = pin {
@@ -487,5 +556,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn service_stop_requires_valid_pin() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = SharedState::load(tempdir.path().join("config.json"))
+            .await
+            .unwrap();
+
+        let mut config = AppConfig::default();
+        config.set_pin("1234").unwrap();
+        state.replace_config(config).await.unwrap();
+
+        let unauthorized = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/service/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"pin":"9999"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/service/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"pin":"1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
     }
 }
