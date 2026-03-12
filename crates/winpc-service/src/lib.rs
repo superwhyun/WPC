@@ -6,9 +6,14 @@ mod state;
 use std::{future::Future, path::PathBuf, time::Duration};
 
 use axum::{
+    body::Body,
+    body::Bytes,
     extract::State,
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    http::{
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, PRAGMA},
+        HeaderMap, HeaderValue, StatusCode,
+    },
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -86,6 +91,9 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/device/unlock", post(unlock))
         .route("/api/device/extend", post(extend))
         .route("/api/device/lock", post(lock))
+        .route("/api/device/windows-lock", post(windows_lock))
+        .route("/api/device/shutdown", post(shutdown))
+        .route("/api/device/snapshot", get(snapshot))
         .with_state(state)
 }
 
@@ -115,8 +123,14 @@ async fn supervisor_loop(state: SharedState) {
     }
 }
 
-async fn index() -> Html<&'static str> {
-    Html(html::INDEX_HTML)
+async fn index() -> impl IntoResponse {
+    (
+        [
+            (CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate")),
+            (PRAGMA, HeaderValue::from_static("no-cache")),
+        ],
+        Html(html::INDEX_HTML),
+    )
 }
 
 async fn healthz() -> &'static str {
@@ -125,18 +139,14 @@ async fn healthz() -> &'static str {
 
 async fn get_status(
     State(state): State<SharedState>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<DeviceStatus>, HttpError> {
-    require_tailnet(&state, &headers).await?;
     Ok(Json(state.device_status().await))
 }
 
 async fn auth_pin(
     State(state): State<SharedState>,
-    headers: HeaderMap,
     Json(payload): Json<AuthPinRequest>,
 ) -> std::result::Result<Json<AuthPinResponse>, HttpError> {
-    require_tailnet(&state, &headers).await?;
     state.verify_pin(&payload.pin).await?;
     let expires_at_utc = Utc::now() + chrono::Duration::minutes(SESSION_TTL_MINUTES);
     let token = Uuid::new_v4().to_string();
@@ -150,20 +160,20 @@ async fn auth_pin(
 async fn unlock(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(payload): Json<LockCommandRequest>,
+    body: Bytes,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
     authorize_control(&state, &headers).await?;
-    let status = state.unlock(payload.duration_minutes).await?;
+    let status = state.unlock(parse_duration_minutes(&body)?).await?;
     Ok(Json(LockActionResponse { status }))
 }
 
 async fn extend(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(payload): Json<LockCommandRequest>,
+    body: Bytes,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
     authorize_control(&state, &headers).await?;
-    let status = state.extend(payload.duration_minutes).await?;
+    let status = state.extend(parse_duration_minutes(&body)?).await?;
     Ok(Json(LockActionResponse { status }))
 }
 
@@ -176,11 +186,60 @@ async fn lock(
     Ok(Json(LockActionResponse { status }))
 }
 
+async fn windows_lock(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, HttpError> {
+    authorize_control(&state, &headers).await?;
+    let expected_sid = state.current_config().await.protected_user_sid;
+    tokio::task::spawn_blocking(move || platform::lock_active_console(expected_sid.as_deref()))
+        .await
+        .map_err(|error| HttpError::internal(error.to_string()))?
+        .map_err(|error| HttpError::internal(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn shutdown(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, HttpError> {
+    authorize_control(&state, &headers).await?;
+    tokio::task::spawn_blocking(platform::shutdown_machine)
+        .await
+        .map_err(|error| HttpError::internal(error.to_string()))?
+        .map_err(|error| HttpError::internal(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn snapshot(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, HttpError> {
+    authorize_control(&state, &headers).await?;
+    let snapshot_path = state
+        .config_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("latest-snapshot.jpg");
+    let expected_sid = state.current_config().await.protected_user_sid;
+    let bytes = tokio::task::spawn_blocking(move || {
+        platform::capture_active_console_snapshot(expected_sid.as_deref(), &snapshot_path)
+    })
+    .await
+    .map_err(|error| HttpError::internal(error.to_string()))?
+    .map_err(|error| HttpError::internal(error.to_string()))?;
+
+    Ok((
+        [(CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
 async fn authorize_control(
     state: &SharedState,
     headers: &HeaderMap,
 ) -> std::result::Result<(), HttpError> {
-    require_tailnet(state, headers).await?;
     let header = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -192,14 +251,56 @@ async fn authorize_control(
     Ok(())
 }
 
-async fn require_tailnet(
-    state: &SharedState,
-    headers: &HeaderMap,
-) -> std::result::Result<String, HttpError> {
-    state
-        .authorize_tailnet(headers)
-        .await
-        .map_err(HttpError::from)
+fn parse_duration_minutes(body: &[u8]) -> std::result::Result<u16, HttpError> {
+    if body.is_empty() {
+        return Ok(30);
+    }
+
+    if let Ok(payload) = serde_json::from_slice::<LockCommandRequest>(body) {
+        return Ok(payload.duration_minutes);
+    }
+
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(duration) = value
+            .get("durationMinutes")
+            .and_then(|v| v.as_u64())
+            .or_else(|| value.as_u64())
+        {
+            return u16::try_from(duration).map_err(|_| HttpError::from(Error::InvalidDuration));
+        }
+        if let Some(duration) = value
+            .get("durationMinutes")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.as_str())
+        {
+            let parsed = duration
+                .parse::<u16>()
+                .map_err(|_| HttpError::from(Error::InvalidDuration))?;
+            return Ok(parsed);
+        }
+    }
+
+    if let Ok(text) = std::str::from_utf8(body) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(30);
+        }
+        if let Some(value) = trimmed.strip_prefix("durationMinutes=") {
+            let parsed = value
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| HttpError::from(Error::InvalidDuration))?;
+            return Ok(parsed);
+        }
+        if let Ok(parsed) = trimmed.parse::<u16>() {
+            return Ok(parsed);
+        }
+    }
+
+    Err(HttpError {
+        status: StatusCode::BAD_REQUEST,
+        message: "durationMinutes must be a number between 1 and 480".to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -208,12 +309,18 @@ struct HttpError {
     message: String,
 }
 
+impl HttpError {
+    fn internal(message: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        }
+    }
+}
+
 impl From<Error> for HttpError {
     fn from(value: Error) -> Self {
         let status = match value {
-            Error::MissingTailnetIdentity | Error::UnauthorizedTailnetIdentity => {
-                StatusCode::UNAUTHORIZED
-            }
             Error::InvalidPin | Error::InvalidSessionToken => StatusCode::UNAUTHORIZED,
             Error::InvalidDuration => StatusCode::BAD_REQUEST,
             Error::ConfigIncomplete(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -246,8 +353,8 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
     let mut config_path =
         std::env::var_os("WINPC_CONFIG_PATH").map_or_else(default_config_path, Into::into);
     let mut protected_user_sid = None;
-    let mut allowed_logins = Vec::new();
     let mut pin = None;
+    let mut warn_only = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -261,11 +368,14 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
                         .ok_or("missing value for --protected-user-sid")?,
                 );
             }
-            "--allowed-login" => {
-                allowed_logins.push(args.next().ok_or("missing value for --allowed-login")?);
-            }
             "--pin" => {
                 pin = Some(args.next().ok_or("missing value for --pin")?);
+            }
+            "--warn-only" => {
+                warn_only = Some(true);
+            }
+            "--enforce-lock" => {
+                warn_only = Some(false);
             }
             other => {
                 return Err(format!("unsupported init-config argument: {other}").into());
@@ -277,11 +387,11 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
     if let Some(sid) = protected_user_sid {
         config.protected_user_sid = Some(sid);
     }
-    if !allowed_logins.is_empty() {
-        config.allowed_tailnet_logins = allowed_logins;
-    }
     if let Some(pin) = pin {
         config.set_pin(&pin)?;
+    }
+    if let Some(value) = warn_only {
+        config.warn_only = value;
     }
     config.save(&config_path)?;
     println!("Wrote config to {}", config_path.display());
@@ -300,16 +410,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn status_requires_tailnet_header() {
+    async fn status_is_available_without_special_headers() {
         let tempdir = tempfile::tempdir().unwrap();
         let state = SharedState::load(tempdir.path().join("config.json"))
-            .await
-            .unwrap();
-        state
-            .replace_config(AppConfig {
-                allowed_tailnet_logins: vec!["parent@example.com".into()],
-                ..AppConfig::default()
-            })
             .await
             .unwrap();
 
@@ -323,7 +426,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -333,10 +436,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = AppConfig {
-            allowed_tailnet_logins: vec!["parent@example.com".into()],
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
         config.set_pin("1234").unwrap();
         state.replace_config(config).await.unwrap();
 
@@ -346,7 +446,6 @@ mod tests {
                     .method("POST")
                     .uri("/api/device/unlock")
                     .header("content-type", "application/json")
-                    .header("tailscale-user-login", "parent@example.com")
                     .body(Body::from(r#"{"durationMinutes":30}"#))
                     .unwrap(),
             )
@@ -354,5 +453,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn duration_parser_accepts_json_and_form_shapes() {
+        assert_eq!(parse_duration_minutes(br#"{"durationMinutes":30}"#).unwrap(), 30);
+        assert_eq!(parse_duration_minutes(br#""45""#).unwrap(), 45);
+        assert_eq!(parse_duration_minutes(br#"15"#).unwrap(), 15);
+        assert_eq!(parse_duration_minutes(b"durationMinutes=20").unwrap(), 20);
+        assert_eq!(parse_duration_minutes(b"").unwrap(), 30);
     }
 }

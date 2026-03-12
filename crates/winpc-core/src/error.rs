@@ -14,10 +14,6 @@ pub enum Error {
     InvalidPin,
     #[error("duration must be between 1 and 480 minutes")]
     InvalidDuration,
-    #[error("missing tailscale identity")]
-    MissingTailnetIdentity,
-    #[error("tailscale identity is not allowed")]
-    UnauthorizedTailnetIdentity,
     #[error("session token is missing or invalid")]
     InvalidSessionToken,
     #[error("failed to parse integer: {0}")]

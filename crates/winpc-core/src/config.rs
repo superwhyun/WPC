@@ -26,9 +26,9 @@ const MAX_DURATION_MINUTES: u16 = 480;
 #[serde(rename_all = "snake_case")]
 pub struct AppConfig {
     pub protected_user_sid: Option<String>,
-    #[serde(default)]
-    pub allowed_tailnet_logins: Vec<String>,
     pub pin_hash: Option<String>,
+    #[serde(default)]
+    pub warn_only: bool,
     pub unlock_expires_at_utc: Option<DateTime<Utc>>,
     pub last_agent_heartbeat_utc: Option<DateTime<Utc>>,
 }
@@ -37,8 +37,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             protected_user_sid: None,
-            allowed_tailnet_logins: Vec::new(),
             pin_hash: None,
+            warn_only: false,
             unlock_expires_at_utc: None,
             last_agent_heartbeat_utc: None,
         }
@@ -145,6 +145,7 @@ impl AppConfig {
     pub fn status(&self, now: DateTime<Utc>, protected_user_logged_in: bool) -> DeviceStatus {
         DeviceStatus {
             mode: self.effective_mode(now),
+            warn_only: self.warn_only,
             unlock_expires_at_utc: self
                 .unlock_expires_at_utc
                 .filter(|expires_at| *expires_at > now),
@@ -204,6 +205,7 @@ mod tests {
     fn expired_unlock_becomes_locked() {
         let now = Utc::now();
         let config = AppConfig {
+            warn_only: false,
             unlock_expires_at_utc: Some(now - Duration::minutes(1)),
             ..AppConfig::default()
         };

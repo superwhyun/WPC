@@ -1,6 +1,12 @@
 #[cfg(windows)]
 mod imp {
-    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, path::PathBuf, sync::mpsc};
+    use std::{
+        ffi::OsStr,
+        fs,
+        os::windows::ffi::OsStrExt,
+        path::{Path, PathBuf},
+        sync::mpsc,
+    };
 
     use chrono::Utc;
     use tokio::runtime::Builder;
@@ -8,15 +14,20 @@ mod imp {
     use windows::{
         core::{PCWSTR, PWSTR},
         Win32::{
-            Foundation::{CloseHandle, HANDLE, HLOCAL},
+            Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
             Security::{
-                Authorization::ConvertSidToStringSidW, CreateProcessAsUserW, GetTokenInformation,
-                TokenUser, TOKEN_INFORMATION_CLASS, TOKEN_USER,
+                Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser,
+                TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
             },
             System::{
-                Memory::LocalFree,
-                RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
-                Threading::{PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW},
+                RemoteDesktop::{
+                    ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+                },
+                Threading::{
+                    CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId,
+                    GetExitCodeProcess, OpenProcessToken, WaitForSingleObject,
+                    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW, INFINITE,
+                },
             },
         },
     };
@@ -70,6 +81,89 @@ mod imp {
         }
 
         Ok(())
+    }
+
+    pub fn lock_active_console(expected_sid: Option<&str>) -> std::io::Result<()> {
+        let rundll32 = system_path("rundll32.exe");
+        let command_line = format!(
+            "\"{}\" user32.dll,LockWorkStation",
+            rundll32.display()
+        );
+        let can_fallback = can_run_in_current_process(expected_sid).unwrap_or(false);
+        match run_in_active_console_session(
+            expected_sid,
+            &rundll32,
+            &command_line,
+            false,
+        ) {
+            Ok(()) => {}
+            Err(error) if can_fallback => {
+                std::process::Command::new(&rundll32)
+                    .arg("user32.dll,LockWorkStation")
+                    .spawn()?;
+                info!("fell back to current-process workstation lock: {error}");
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    pub fn shutdown_machine() -> std::io::Result<()> {
+        std::process::Command::new(system_path("shutdown.exe"))
+            .args(["/s", "/t", "0", "/f"])
+            .spawn()?;
+        Ok(())
+    }
+
+    pub fn capture_active_console_snapshot(
+        expected_sid: Option<&str>,
+        output_path: &Path,
+    ) -> std::io::Result<Vec<u8>> {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if output_path.exists() {
+            let _ = fs::remove_file(output_path);
+        }
+
+        let script_path = output_path.with_extension("ps1");
+        fs::write(&script_path, snapshot_script(output_path))?;
+
+        let powershell = system_path("WindowsPowerShell\\v1.0\\powershell.exe");
+        let command_line = format!(
+            "\"{}\" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{}\"",
+            powershell.display(),
+            script_path.display()
+        );
+        let can_fallback = can_run_in_current_process(expected_sid).unwrap_or(false);
+
+        match run_in_active_console_session(expected_sid, &powershell, &command_line, true) {
+            Ok(()) => {}
+            Err(error) if can_fallback => {
+                let status = std::process::Command::new(&powershell)
+                    .args([
+                        "-NoProfile",
+                        "-WindowStyle",
+                        "Hidden",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                    ])
+                    .arg(&script_path)
+                    .status()?;
+                if !status.success() {
+                    return Err(std::io::Error::other(format!(
+                        "snapshot helper exited with status {status}"
+                    )));
+                }
+                info!("fell back to current-process snapshot capture: {error}");
+            }
+            Err(error) => return Err(error),
+        }
+
+        let bytes = fs::read(output_path)?;
+        let _ = fs::remove_file(&script_path);
+        Ok(bytes)
     }
 
     fn block_on_console() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -138,54 +232,21 @@ mod imp {
         Ok(active_console_user_sid()?.as_deref() == Some(expected_sid))
     }
 
+    fn can_run_in_current_process(expected_sid: Option<&str>) -> std::io::Result<bool> {
+        if !current_process_is_active_console_session()? {
+            return Ok(false);
+        }
+
+        match expected_sid {
+            Some(expected_sid) => Ok(current_process_user_sid()? == expected_sid),
+            None => Ok(true),
+        }
+    }
+
     fn spawn_agent_for_active_console_user(expected_sid: &str) -> std::io::Result<()> {
-        if !active_console_matches_sid(expected_sid)? {
-            return Ok(());
-        }
-
-        let session_id = unsafe { WTSGetActiveConsoleSessionId() };
-        if session_id == u32::MAX {
-            return Ok(());
-        }
-
-        let mut token = HANDLE::default();
-        unsafe { WTSQueryUserToken(session_id, &mut token) }.ok()?;
-
         let agent_path = current_agent_path()?;
-        let application = wide(agent_path.as_os_str());
-        let desktop = wide(OsStr::new("winsta0\\default"));
-        let mut startup_info = STARTUPINFOW::default();
-        startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        startup_info.lpDesktop = PWSTR(desktop.as_ptr() as *mut _);
-        let mut process_info = PROCESS_INFORMATION::default();
-
-        let result = unsafe {
-            CreateProcessAsUserW(
-                token,
-                PCWSTR(application.as_ptr()),
-                PWSTR::null(),
-                None,
-                None,
-                false,
-                PROCESS_CREATION_FLAGS(0),
-                None,
-                PCWSTR::null(),
-                &startup_info,
-                &mut process_info,
-            )
-        };
-
-        unsafe {
-            let _ = CloseHandle(token);
-            if process_info.hProcess != HANDLE::default() {
-                let _ = CloseHandle(process_info.hProcess);
-            }
-            if process_info.hThread != HANDLE::default() {
-                let _ = CloseHandle(process_info.hThread);
-            }
-        }
-
-        result.ok()?;
+        let command_line = format!("\"{}\"", agent_path.display());
+        run_in_active_console_session(Some(expected_sid), &agent_path, &command_line, false)?;
         info!("spawned winpc-agent for active console session");
         Ok(())
     }
@@ -203,7 +264,7 @@ mod imp {
 
         let mut token = HANDLE::default();
         let result = unsafe { WTSQueryUserToken(session_id, &mut token) };
-        if let Err(error) = result.ok() {
+        if let Err(error) = result {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 error.to_string(),
@@ -217,17 +278,41 @@ mod imp {
         sid.map(Some)
     }
 
+    fn current_process_is_active_console_session() -> std::io::Result<bool> {
+        let active_session_id = unsafe { WTSGetActiveConsoleSessionId() };
+        if active_session_id == u32::MAX {
+            return Ok(false);
+        }
+
+        let mut session_id = 0u32;
+        unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) }
+            .map_err(|error: windows::core::Error| std::io::Error::other(error.to_string()))?;
+        Ok(session_id == active_session_id)
+    }
+
+    fn current_process_user_sid() -> std::io::Result<String> {
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .map_err(|error: windows::core::Error| std::io::Error::other(error.to_string()))?;
+
+        let sid = token_user_sid(token);
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        sid
+    }
+
     fn token_user_sid(token: HANDLE) -> std::io::Result<String> {
         let mut size = 0u32;
-        unsafe {
-            let _ = GetTokenInformation(
+        let _ = unsafe {
+            GetTokenInformation(
                 token,
                 TOKEN_INFORMATION_CLASS(TokenUser.0),
                 None,
                 0,
                 &mut size,
-            );
-        }
+            )
+        };
 
         let mut buffer = vec![0u8; size as usize];
         unsafe {
@@ -239,21 +324,127 @@ mod imp {
                 &mut size,
             )
         }
-        .ok()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
 
         let token_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
         let mut sid_ptr = PWSTR::null();
         unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) }
-            .ok()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
-        let sid = sid_ptr
-            .to_string()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let sid = unsafe { sid_ptr.to_string() }
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         unsafe {
-            let _ = LocalFree(HLOCAL(sid_ptr.0 as isize));
+            let _ = LocalFree(Some(HLOCAL(sid_ptr.0.cast())));
         }
         Ok(sid)
+    }
+
+    fn run_in_active_console_session(
+        expected_sid: Option<&str>,
+        application: &Path,
+        command_line: &str,
+        wait: bool,
+    ) -> std::io::Result<()> {
+        if let Some(expected_sid) = expected_sid {
+            if !active_console_matches_sid(expected_sid)? {
+                return Err(std::io::Error::other(
+                    "active console session does not match the protected user",
+                ));
+            }
+        }
+
+        let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+        if session_id == u32::MAX {
+            return Err(std::io::Error::other("no active console session"));
+        }
+
+        let mut token = HANDLE::default();
+        unsafe { WTSQueryUserToken(session_id, &mut token) }
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+        let application = wide(application.as_os_str());
+        let mut command_line = wide(OsStr::new(command_line));
+        let desktop = wide(OsStr::new("winsta0\\default"));
+        let mut startup_info = STARTUPINFOW::default();
+        startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        startup_info.lpDesktop = PWSTR(desktop.as_ptr() as *mut _);
+        let mut process_info = PROCESS_INFORMATION::default();
+
+        let result = unsafe {
+            CreateProcessAsUserW(
+                Some(token),
+                PCWSTR(application.as_ptr()),
+                Some(PWSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                false,
+                PROCESS_CREATION_FLAGS(0),
+                None,
+                PCWSTR::null(),
+                &startup_info,
+                &mut process_info,
+            )
+        };
+
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+
+        result.map_err(|error| std::io::Error::other(error.to_string()))?;
+
+        if wait {
+            wait_for_process(process_info.hProcess)?;
+        }
+
+        unsafe {
+            if process_info.hProcess != HANDLE::default() {
+                let _ = CloseHandle(process_info.hProcess);
+            }
+            if process_info.hThread != HANDLE::default() {
+                let _ = CloseHandle(process_info.hThread);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn wait_for_process(process: HANDLE) -> std::io::Result<()> {
+        unsafe {
+            let _ = WaitForSingleObject(process, INFINITE);
+            let mut exit_code = 0u32;
+            GetExitCodeProcess(process, &mut exit_code)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if exit_code != 0 {
+                return Err(std::io::Error::other(format!(
+                    "helper exited with status {exit_code}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot_script(output_path: &Path) -> String {
+        let output = output_path.display().to_string().replace('\'', "''");
+        format!(
+            r#"$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size)
+$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object {{ $_.MimeType -eq 'image/jpeg' }} | Select-Object -First 1
+$params = New-Object System.Drawing.Imaging.EncoderParameters 1
+$params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 80L)
+$bitmap.Save('{output}', $codec, $params)
+$graphics.Dispose()
+$bitmap.Dispose()
+"#
+        )
+    }
+
+    fn system_path(relative: &str) -> PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        PathBuf::from(root).join("System32").join(relative)
     }
 
     fn wide(value: &OsStr) -> Vec<u16> {
@@ -263,6 +454,8 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    use std::path::Path;
+
     use crate::state::SharedState;
 
     pub fn run() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -279,6 +472,24 @@ mod imp {
         let _ = state.mark_agent_unhealthy_if_needed().await;
         Ok(())
     }
+
+    pub fn lock_active_console(_expected_sid: Option<&str>) -> std::io::Result<()> {
+        Err(std::io::Error::other("windows lock is only supported on Windows"))
+    }
+
+    pub fn shutdown_machine() -> std::io::Result<()> {
+        Err(std::io::Error::other("shutdown is only supported on Windows"))
+    }
+
+    pub fn capture_active_console_snapshot(
+        _expected_sid: Option<&str>,
+        _output_path: &Path,
+    ) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("snapshot capture is only supported on Windows"))
+    }
 }
 
-pub use imp::{run, supervisor_tick};
+pub use imp::{
+    capture_active_console_snapshot, lock_active_console, run, shutdown_machine,
+    supervisor_tick,
+};

@@ -12,6 +12,7 @@ pub enum DeviceMode {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceStatus {
     pub mode: DeviceMode,
+    pub warn_only: bool,
     pub unlock_expires_at_utc: Option<DateTime<Utc>>,
     pub remaining_minutes: u64,
     pub agent_healthy: bool,

@@ -5,9 +5,6 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Pin,
 
-    [Parameter(Mandatory = $true)]
-    [string[]]$AllowedLogins,
-
     [string]$InstallDir = (Join-Path $env:ProgramFiles "WinParentalControl"),
     [string]$ServiceName = "WinParentalControlService"
 )
@@ -42,12 +39,7 @@ $args = @(
     "--pin", $Pin
 )
 
-foreach ($login in $AllowedLogins) {
-    $args += @("--allowed-login", $login)
-}
-
 & $serviceExe @args
 Restart-Service -Name $ServiceName
 
 Write-Host "Protected child user configured: $ChildUser ($sid)"
-Write-Host "Allowed parent logins: $($AllowedLogins -join ', ')"

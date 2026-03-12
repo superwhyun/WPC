@@ -3,11 +3,10 @@ mod imp {
     use std::{ptr::null_mut, slice};
 
     use windows::Win32::{
-        Foundation::HLOCAL,
+        Foundation::{HLOCAL, LocalFree},
         Security::Cryptography::{
             CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
         },
-        System::Memory::LocalFree,
     };
 
     use crate::{Error, Result};
@@ -31,7 +30,7 @@ mod imp {
             .map_err(|_| Error::SecretSeal)?;
 
             let bytes = slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            let _ = LocalFree(HLOCAL(out_blob.pbData as isize));
+            let _ = LocalFree(Some(HLOCAL(out_blob.pbData.cast())));
             Ok(bytes)
         }
     }
@@ -45,7 +44,7 @@ mod imp {
             let mut out_blob = CRYPT_INTEGER_BLOB::default();
             CryptUnprotectData(
                 &mut in_blob,
-                null_mut(),
+                Some(null_mut()),
                 None,
                 None,
                 None,
@@ -55,7 +54,7 @@ mod imp {
             .map_err(|_| Error::SecretUnseal)?;
 
             let bytes = slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-            let _ = LocalFree(HLOCAL(out_blob.pbData as isize));
+            let _ = LocalFree(Some(HLOCAL(out_blob.pbData.cast())));
             Ok(bytes)
         }
     }
@@ -75,3 +74,5 @@ mod imp {
 }
 
 pub use imp::{seal_bytes, unseal_bytes};
+
+

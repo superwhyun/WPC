@@ -101,6 +101,45 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       gap: 12px;
       flex-wrap: wrap;
     }
+    .snapshot {
+      margin-top: 18px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      background: rgba(15, 23, 42, 0.45);
+    }
+    .snapshot-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .snapshot img {
+      width: 100%;
+      min-height: 220px;
+      max-height: 420px;
+      object-fit: contain;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background:
+        radial-gradient(circle at top, rgba(245, 158, 11, 0.12), transparent 28%),
+        rgba(2, 6, 23, 0.88);
+    }
+    .snapshot-empty {
+      display: grid;
+      place-items: center;
+      min-height: 220px;
+      border-radius: 12px;
+      border: 1px dashed var(--border);
+      color: var(--muted);
+      background: rgba(2, 6, 23, 0.5);
+      text-align: center;
+      padding: 16px;
+    }
+    .hidden {
+      display: none;
+    }
     .message {
       margin-top: 12px;
       min-height: 24px;
@@ -113,29 +152,44 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <body>
   <main class="panel">
     <h1>WinParentalControl</h1>
-    <p>Tailnet inside control page for lock, unlock and time-limited access.</p>
+    <p>Local control page for lock, unlock and time-limited access.</p>
     <section class="status">
       <article class="card"><div class="label">Mode</div><div class="value" id="mode">-</div></article>
       <article class="card"><div class="label">Remaining</div><div class="value" id="remaining">-</div></article>
       <article class="card"><div class="label">Agent</div><div class="value" id="agent">-</div></article>
       <article class="card"><div class="label">User Session</div><div class="value" id="session">-</div></article>
     </section>
-    <form id="auth-form">
+    <section id="auth-form">
       <div class="label">Parent PIN Session</div>
       <div class="row">
         <input type="password" id="pin" placeholder="PIN" />
         <input type="number" id="duration" min="1" max="480" value="30" />
-        <button type="submit">Unlock</button>
+        <button type="button" id="unlock">Unlock</button>
       </div>
       <div class="actions">
         <button type="button" class="secondary" id="extend">Extend</button>
         <button type="button" class="danger" id="lock">Lock now</button>
+        <button type="button" class="secondary" id="windows-lock">Windows lock</button>
+        <button type="button" class="danger" id="shutdown">Shut down</button>
       </div>
       <div class="message" id="message"></div>
-    </form>
+    </section>
+    <section class="snapshot">
+      <div class="snapshot-header">
+        <div>
+          <div class="label">Live Snapshot</div>
+          <p id="snapshot-meta">Capture the current child session on demand.</p>
+        </div>
+        <button type="button" class="secondary" id="snapshot-button">Capture snapshot</button>
+      </div>
+      <div id="snapshot-empty" class="snapshot-empty">No snapshot captured yet.</div>
+      <img id="snapshot-image" class="hidden" alt="Current child session snapshot" />
+    </section>
   </main>
   <script>
     let token = null;
+    let currentModeState = { mode: "locked" };
+    let snapshotUrl = null;
 
     async function request(path, options = {}) {
       const headers = Object.assign({"Content-Type": "application/json"}, options.headers || {});
@@ -149,12 +203,26 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     async function refresh() {
       try {
         const status = await request("/api/device/status", { method: "GET", headers: {} });
+        currentModeState.mode = status.mode;
         document.getElementById("mode").textContent = status.mode;
         document.getElementById("remaining").textContent = `${status.remainingMinutes} min`;
         document.getElementById("agent").textContent = status.agentHealthy ? "healthy" : "stale";
         document.getElementById("session").textContent = status.protectedUserLoggedIn ? "online" : "offline";
+        syncActions(status);
       } catch (error) {
         setMessage(error.message, true);
+      }
+    }
+
+    function syncActions(status) {
+      const unlockButton = document.getElementById("unlock");
+      const extendButton = document.getElementById("extend");
+      if (status.mode === "unlocked") {
+        unlockButton.classList.add("hidden");
+        extendButton.classList.remove("hidden");
+      } else {
+        unlockButton.classList.remove("hidden");
+        extendButton.classList.add("hidden");
       }
     }
 
@@ -162,6 +230,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       const node = document.getElementById("message");
       node.className = `message ${isError ? "error" : "ok"}`;
       node.textContent = message;
+    }
+
+    function setSnapshotMeta(message) {
+      document.getElementById("snapshot-meta").textContent = message;
     }
 
     async function auth(pin) {
@@ -172,21 +244,69 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       token = body.token;
     }
 
-    async function action(path) {
-      const durationMinutes = Number(document.getElementById("duration").value || "30");
-      const result = await request(path, {
-        method: "POST",
-        body: path.endsWith("lock") ? undefined : JSON.stringify({ durationMinutes }),
-      });
-      setMessage(`Mode: ${result.status.mode}, remaining ${result.status.remainingMinutes} min`);
-      await refresh();
+    function readDurationMinutes() {
+      const raw = document.getElementById("duration").value.trim();
+      const parsed = Number.parseInt(raw || "30", 10);
+      if (!Number.isFinite(parsed) || parsed < 1 || parsed > 480) {
+        throw new Error("Duration must be between 1 and 480 minutes.");
+      }
+      return parsed;
     }
 
-    document.getElementById("auth-form").addEventListener("submit", async (event) => {
-      event.preventDefault();
+    async function action(path) {
+      const options = { method: "POST" };
+      if (!path.endsWith("lock")) {
+        options.body = JSON.stringify({ durationMinutes: readDurationMinutes() });
+      }
+
+      const result = await request(path, options);
+      if (path.endsWith("lock")) {
+        setMessage("Locked now.");
+      } else {
+        setMessage(`Mode: ${result.status.mode}, remaining ${result.status.remainingMinutes} min`);
+      }
+      return result;
+    }
+
+    async function ensureAuth() {
+      if (!token) {
+        await auth(document.getElementById("pin").value);
+      }
+    }
+
+    async function captureSnapshot() {
+      await ensureAuth();
+      const response = await fetch("/api/device/snapshot", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        try {
+          const body = await response.json();
+          message = body.error || message;
+        } catch {}
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      if (snapshotUrl) URL.revokeObjectURL(snapshotUrl);
+      snapshotUrl = URL.createObjectURL(blob);
+      document.getElementById("snapshot-image").src = snapshotUrl;
+      document.getElementById("snapshot-image").classList.remove("hidden");
+      document.getElementById("snapshot-empty").classList.add("hidden");
+      setSnapshotMeta(`Captured at ${new Date().toLocaleTimeString()}`);
+    }
+
+    document.getElementById("unlock").addEventListener("click", async () => {
+      if (currentModeState.mode === "unlocked") {
+        setMessage("Already unlocked. Use Extend or Lock now.");
+        return;
+      }
       try {
         await auth(document.getElementById("pin").value);
         await action("/api/device/unlock");
+        await refresh();
       } catch (error) {
         setMessage(error.message, true);
       }
@@ -194,8 +314,9 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 
     document.getElementById("extend").addEventListener("click", async () => {
       try {
-        if (!token) await auth(document.getElementById("pin").value);
+        await ensureAuth();
         await action("/api/device/extend");
+        await refresh();
       } catch (error) {
         setMessage(error.message, true);
       }
@@ -203,10 +324,39 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 
     document.getElementById("lock").addEventListener("click", async () => {
       try {
-        if (!token) await auth(document.getElementById("pin").value);
+        await ensureAuth();
         await action("/api/device/lock");
+        await refresh();
       } catch (error) {
         setMessage(error.message, true);
+      }
+    });
+
+    document.getElementById("windows-lock").addEventListener("click", async () => {
+      try {
+        await ensureAuth();
+        await request("/api/device/windows-lock", { method: "POST" });
+        setMessage("Windows lock requested.");
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
+
+    document.getElementById("shutdown").addEventListener("click", async () => {
+      try {
+        await ensureAuth();
+        await request("/api/device/shutdown", { method: "POST" });
+        setMessage("Shutdown requested.");
+      } catch (error) {
+        setMessage(error.message, true);
+      }
+    });
+
+    document.getElementById("snapshot-button").addEventListener("click", async () => {
+      try {
+        await captureSnapshot();
+      } catch (error) {
+        setSnapshotMeta(error.message);
       }
     });
 

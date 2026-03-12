@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod windows_app {
     use std::{
+        ffi::c_void,
         sync::{Arc, Mutex, OnceLock},
         thread,
         time::Duration,
@@ -13,22 +14,30 @@ mod windows_app {
         runtime::Builder,
     };
     use windows::{
-        core::{w, PCWSTR, PWSTR},
+        core::{w, PCWSTR},
         Win32::{
             Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM},
-            System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
+            Graphics::Gdi::{
+                CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+                DEFAULT_PITCH, FF_MODERN, FF_SWISS, FONT_CLIP_PRECISION,
+                FONT_OUTPUT_PRECISION, FW_BOLD, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS,
+            },
+            System::{
+                LibraryLoader::GetModuleHandleW,
+                SystemServices::{STATIC_STYLES, SS_CENTER},
+                Threading::CreateMutexW,
+            },
             UI::WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetDlgItem,
                 GetMessageW, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, LoadCursorW,
                 PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowPos,
-                SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON, CREATESTRUCTW,
-                CW_USEDEFAULT, ES_CENTER, ES_PASSWORD, GWLP_USERDATA, HMENU, HWND_TOPMOST,
-                IDC_ARROW, MSG, MSGFLT_ALLOW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SS_CENTER, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-                SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SIZE, WM_TIMER,
-                WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
-                WS_POPUP, WS_VISIBLE,
+                SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON, ES_CENTER, ES_PASSWORD,
+                HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SendMessageW, SM_CXVIRTUALSCREEN,
+                SM_CYVIRTUALSCREEN,
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+                SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+                WM_DESTROY, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_VISIBLE,
             },
         },
     };
@@ -43,6 +52,9 @@ mod windows_app {
     const ID_TITLE_LABEL: i32 = 2004;
     const ID_MESSAGE_LABEL: i32 = 2005;
     const ID_HINT_LABEL: i32 = 2006;
+    const ID_TIMER_LABEL: i32 = 2007;
+    const WARN_ONLY_WIDTH: i32 = 560;
+    const WARN_ONLY_HEIGHT: i32 = 380;
 
     static UI_STATE: OnceLock<Arc<Mutex<UiState>>> = OnceLock::new();
 
@@ -50,13 +62,17 @@ mod windows_app {
     struct UiState {
         status: DeviceStatus,
         message: String,
-        hwnd: HWND,
-        title_hwnd: HWND,
-        hint_hwnd: HWND,
-        pin_hwnd: HWND,
-        duration_hwnd: HWND,
-        button_hwnd: HWND,
-        message_hwnd: HWND,
+        hwnd: isize,
+        title_hwnd: isize,
+        timer_hwnd: isize,
+        hint_hwnd: isize,
+        pin_hwnd: isize,
+        duration_hwnd: isize,
+        button_hwnd: isize,
+        message_hwnd: isize,
+        title_font: isize,
+        timer_font: isize,
+        body_font: isize,
         is_visible: bool,
     }
 
@@ -65,6 +81,7 @@ mod windows_app {
             Self {
                 status: DeviceStatus {
                     mode: DeviceMode::Locked,
+                    warn_only: false,
                     unlock_expires_at_utc: None,
                     remaining_minutes: 0,
                     agent_healthy: false,
@@ -72,15 +89,90 @@ mod windows_app {
                     last_seen_at_utc: None,
                 },
                 message: "Waiting for service heartbeat...".to_string(),
-                hwnd: HWND::default(),
-                title_hwnd: HWND::default(),
-                hint_hwnd: HWND::default(),
-                pin_hwnd: HWND::default(),
-                duration_hwnd: HWND::default(),
-                button_hwnd: HWND::default(),
-                message_hwnd: HWND::default(),
+                hwnd: 0,
+                title_hwnd: 0,
+                timer_hwnd: 0,
+                hint_hwnd: 0,
+                pin_hwnd: 0,
+                duration_hwnd: 0,
+                button_hwnd: 0,
+                message_hwnd: 0,
+                title_font: 0,
+                timer_font: 0,
+                body_font: 0,
                 is_visible: true,
             }
+        }
+    }
+
+    fn hwnd_to_raw(hwnd: HWND) -> isize {
+        hwnd.0 as isize
+    }
+
+    fn hwnd_from_raw(raw: isize) -> HWND {
+        HWND(raw as *mut c_void)
+    }
+
+    fn hmenu_from_id(id: i32) -> HMENU {
+        HMENU(id as usize as *mut c_void)
+    }
+
+    fn hfont_to_raw(font: HFONT) -> isize {
+        font.0 as isize
+    }
+
+    fn child_style(extra: u32) -> WINDOW_STYLE {
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | extra)
+    }
+
+    fn static_center_style() -> WINDOW_STYLE {
+        child_style(STATIC_STYLES(SS_CENTER.0).0)
+    }
+
+    fn countdown_text(status: &DeviceStatus) -> String {
+        let Some(expires_at) = status.unlock_expires_at_utc else {
+            return "00:00".to_string();
+        };
+        let remaining = (expires_at - Utc::now()).num_seconds().max(0);
+        let hours = remaining / 3600;
+        let minutes = (remaining % 3600) / 60;
+        let seconds = remaining % 60;
+        if hours > 0 {
+            format!("{hours:02}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("{minutes:02}:{seconds:02}")
+        }
+    }
+
+    fn create_font(height: i32, weight: i32, family: u32, face: PCWSTR) -> HFONT {
+        unsafe {
+            CreateFontW(
+                height,
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                FONT_OUTPUT_PRECISION(OUT_DEFAULT_PRECIS.0),
+                FONT_CLIP_PRECISION(CLIP_DEFAULT_PRECIS.0),
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH.0 as u32 | family,
+                face,
+            )
+        }
+    }
+
+    fn apply_font(hwnd: HWND, font: HFONT) {
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
         }
     }
 
@@ -91,7 +183,19 @@ mod windows_app {
             return Ok(());
         }
 
-        let state = Arc::new(Mutex::new(UiState::default()));
+        let mut initial_state = UiState::default();
+        if let Ok(IpcResponse::State(status) | IpcResponse::Ack(status)) =
+            pipe_request(IpcRequest::GetState)
+        {
+            initial_state.status = status;
+            initial_state.message = if initial_state.status.warn_only {
+                "Test mode active. Lock is not enforced.".to_string()
+            } else {
+                "Waiting for service heartbeat...".to_string()
+            };
+        }
+
+        let state = Arc::new(Mutex::new(initial_state));
         let _ = UI_STATE.set(state.clone());
         spawn_polling_thread(state);
         run_message_loop()?;
@@ -113,43 +217,67 @@ mod windows_app {
         };
 
         unsafe { RegisterClassW(&class) };
-        let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        let (style, ex_style, x, y, width, height) = if let Some(state) = UI_STATE.get() {
+            let guard = state.lock().unwrap();
+            if guard.status.warn_only {
+                (WS_OVERLAPPED | WS_VISIBLE, WINDOW_EX_STYLE::default(), 40, 40, WARN_ONLY_WIDTH, WARN_ONLY_HEIGHT)
+            } else {
+                (
+                    WS_VISIBLE,
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                    unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+                    unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+                    unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+                    unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+                )
+            }
+        } else {
+            (
+                WS_VISIBLE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+                unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+                unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+                unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+            )
+        };
 
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                ex_style,
                 PCWSTR(class_name.as_ptr()),
                 w!("WinParentalControl"),
-                WS_POPUP | WS_VISIBLE,
+                style,
                 x,
                 y,
                 width,
                 height,
                 None,
                 None,
-                instance,
+                Some(instance.into()),
                 None,
             )
         }
         .map_err(|error| error.to_string())?;
 
         unsafe {
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
-            SetTimer(hwnd, TIMER_ID, 1000, None);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            SetTimer(Some(hwnd), TIMER_ID, 1000, None);
+            if let Some(state) = UI_STATE.get() {
+                if !state.lock().unwrap().status.warn_only {
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
         }
 
         if let Some(state) = UI_STATE.get() {
-            state.lock().unwrap().hwnd = hwnd;
+            state.lock().unwrap().hwnd = hwnd_to_raw(hwnd);
         }
 
         let mut message = MSG::default();
-        while unsafe { GetMessageW(&mut message, HWND::default(), 0, 0) }.into() {
+        while unsafe { GetMessageW(&mut message, None, 0, 0) }.into() {
             unsafe {
-                TranslateMessage(&message);
+                let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }
@@ -166,8 +294,16 @@ mod windows_app {
             match (heartbeat, state_response) {
                 (Ok(_), Ok(IpcResponse::State(status))) => {
                     ui.status = status;
-                    ui.message = if ui.status.mode == DeviceMode::Locked {
+                    ui.message = if ui.status.mode == DeviceMode::Locked && ui.status.warn_only {
+                        "Test mode: lock would be active now, but enforcement is disabled."
+                            .to_string()
+                    } else if ui.status.mode == DeviceMode::Locked {
                         "Locked. Parent PIN required.".to_string()
+                    } else if ui.status.warn_only {
+                        format!(
+                            "Test mode active. {} remaining until lock resumes.",
+                            countdown_text(&ui.status)
+                        )
                     } else {
                         "Unlocked by parent.".to_string()
                     };
@@ -261,18 +397,40 @@ mod windows_app {
     }
 
     fn create_controls(hwnd: HWND) {
+        let title_font = create_font(-30, FW_BOLD.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
+        let timer_font =
+            create_font(-54, FW_BOLD.0 as i32, FF_MODERN.0 as u32, w!("Consolas"));
+        let body_font = create_font(-20, FW_NORMAL.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
+
         let title = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Screen locked"),
-                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                w!("CONTROL ACTIVE"),
+                static_center_style(),
                 0,
                 0,
                 100,
                 40,
-                hwnd,
-                HMENU(ID_TITLE_LABEL as isize),
+                Some(hwnd),
+                Some(hmenu_from_id(ID_TITLE_LABEL)),
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let timer = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("00:00"),
+                static_center_style(),
+                0,
+                0,
+                100,
+                72,
+                Some(hwnd),
+                Some(hmenu_from_id(ID_TIMER_LABEL)),
                 None,
                 None,
             )
@@ -282,14 +440,14 @@ mod windows_app {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Parent PIN and duration are required to unlock."),
-                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                w!("Use the timer as your guide. Extend time or lock instantly."),
+                static_center_style(),
                 0,
                 0,
                 100,
                 40,
-                hwnd,
-                HMENU(ID_HINT_LABEL as isize),
+                Some(hwnd),
+                Some(hmenu_from_id(ID_HINT_LABEL)),
                 None,
                 None,
             )
@@ -300,13 +458,13 @@ mod windows_app {
                 WINDOW_EX_STYLE::default(),
                 w!("EDIT"),
                 w!(""),
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER | ES_PASSWORD,
+                child_style(WS_BORDER.0 | ES_CENTER as u32 | ES_PASSWORD as u32),
                 0,
                 0,
                 100,
                 40,
-                hwnd,
-                HMENU(ID_PIN_EDIT as isize),
+                Some(hwnd),
+                Some(hmenu_from_id(ID_PIN_EDIT)),
                 None,
                 None,
             )
@@ -317,13 +475,13 @@ mod windows_app {
                 WINDOW_EX_STYLE::default(),
                 w!("EDIT"),
                 w!("30"),
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER,
+                child_style(WS_BORDER.0 | ES_CENTER as u32),
                 0,
                 0,
                 100,
                 40,
-                hwnd,
-                HMENU(ID_DURATION_EDIT as isize),
+                Some(hwnd),
+                Some(hmenu_from_id(ID_DURATION_EDIT)),
                 None,
                 None,
             )
@@ -334,13 +492,13 @@ mod windows_app {
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 w!("Unlock"),
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                child_style(BS_PUSHBUTTON as u32),
                 0,
                 0,
                 100,
                 40,
-                hwnd,
-                HMENU(ID_UNLOCK_BUTTON as isize),
+                Some(hwnd),
+                Some(hmenu_from_id(ID_UNLOCK_BUTTON)),
                 None,
                 None,
             )
@@ -350,29 +508,41 @@ mod windows_app {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Waiting for service..."),
-                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                w!("Waiting for service sync..."),
+                static_center_style(),
                 0,
                 0,
                 100,
-                60,
-                hwnd,
-                HMENU(ID_MESSAGE_LABEL as isize),
+                72,
+                Some(hwnd),
+                Some(hmenu_from_id(ID_MESSAGE_LABEL)),
                 None,
                 None,
             )
         }
         .unwrap();
 
+        apply_font(title, title_font);
+        apply_font(timer, timer_font);
+        apply_font(hint, body_font);
+        apply_font(pin, body_font);
+        apply_font(duration, body_font);
+        apply_font(button, body_font);
+        apply_font(message, body_font);
+
         if let Some(state) = UI_STATE.get() {
             let mut guard = state.lock().unwrap();
-            guard.hwnd = hwnd;
-            guard.title_hwnd = title;
-            guard.hint_hwnd = hint;
-            guard.pin_hwnd = pin;
-            guard.duration_hwnd = duration;
-            guard.button_hwnd = button;
-            guard.message_hwnd = message;
+            guard.hwnd = hwnd_to_raw(hwnd);
+            guard.title_hwnd = hwnd_to_raw(title);
+            guard.timer_hwnd = hwnd_to_raw(timer);
+            guard.hint_hwnd = hwnd_to_raw(hint);
+            guard.pin_hwnd = hwnd_to_raw(pin);
+            guard.duration_hwnd = hwnd_to_raw(duration);
+            guard.button_hwnd = hwnd_to_raw(button);
+            guard.message_hwnd = hwnd_to_raw(message);
+            guard.title_font = hfont_to_raw(title_font);
+            guard.timer_font = hfont_to_raw(timer_font);
+            guard.body_font = hfont_to_raw(body_font);
         }
     }
 
@@ -382,25 +552,25 @@ mod windows_app {
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
         let center_x = width / 2;
-        let top = height / 2 - 140;
-        let panel_width = 420;
+        let top = height / 2 - 180;
+        let panel_width = 460;
         let left = center_x - panel_width / 2;
 
-        move_control(ID_TITLE_LABEL, left, top, panel_width, 48);
-        move_control(ID_HINT_LABEL, left, top + 56, panel_width, 32);
-        move_control(ID_PIN_EDIT, left + 40, top + 112, 340, 36);
-        move_control(ID_DURATION_EDIT, left + 40, top + 160, 340, 36);
-        move_control(ID_UNLOCK_BUTTON, left + 40, top + 208, 340, 42);
-        move_control(ID_MESSAGE_LABEL, left, top + 268, panel_width, 60);
+        move_control(ID_TITLE_LABEL, left, top, panel_width, 40);
+        move_control(ID_TIMER_LABEL, left, top + 46, panel_width, 86);
+        move_control(ID_HINT_LABEL, left, top + 136, panel_width, 34);
+        move_control(ID_MESSAGE_LABEL, left + 24, top + 176, panel_width - 48, 60);
+        move_control(ID_PIN_EDIT, left + 50, top + 252, panel_width - 100, 38);
+        move_control(ID_DURATION_EDIT, left + 50, top + 298, panel_width - 100, 38);
+        move_control(ID_UNLOCK_BUTTON, left + 50, top + 346, panel_width - 100, 44);
     }
 
     fn move_control(id: i32, x: i32, y: i32, width: i32, height: i32) {
         if let Some(state) = UI_STATE.get() {
-            let hwnd = state.lock().unwrap().hwnd;
-            let child = unsafe { GetDlgItem(hwnd, id) };
-            if child.0 != 0 {
+            let hwnd = hwnd_from_raw(state.lock().unwrap().hwnd);
+            if let Ok(child) = unsafe { GetDlgItem(Some(hwnd), id) } {
                 unsafe {
-                    SetWindowPos(child, HWND::default(), x, y, width, height, SWP_NOACTIVATE)
+                    SetWindowPos(child, None, x, y, width, height, SWP_NOACTIVATE)
                 }
                 .unwrap();
             }
@@ -413,7 +583,7 @@ mod windows_app {
         };
         let (pin_hwnd, duration_hwnd) = {
             let guard = state.lock().unwrap();
-            (guard.pin_hwnd, guard.duration_hwnd)
+            (hwnd_from_raw(guard.pin_hwnd), hwnd_from_raw(guard.duration_hwnd))
         };
 
         let pin = read_control_text(pin_hwnd);
@@ -450,8 +620,8 @@ mod windows_app {
             return String::new();
         }
         let mut buffer = vec![0u16; len as usize + 1];
-        unsafe { GetWindowTextW(hwnd, PWSTR(buffer.as_mut_ptr()), buffer.len() as i32) };
-        String::from_utf16_lossy(&buffer[..len as usize])
+        let copied = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..copied as usize])
             .trim()
             .to_string()
     }
@@ -460,62 +630,141 @@ mod windows_app {
         let Some(state) = UI_STATE.get() else {
             return;
         };
-        let mut guard = state.lock().unwrap();
+        let (
+            status,
+            message,
+            title_hwnd,
+            timer_hwnd,
+            hint_hwnd,
+            message_hwnd,
+            hwnd,
+            was_visible,
+        ) = {
+            let guard = state.lock().unwrap();
+            (
+                guard.status.clone(),
+                guard.message.clone(),
+                hwnd_from_raw(guard.title_hwnd),
+                hwnd_from_raw(guard.timer_hwnd),
+                hwnd_from_raw(guard.hint_hwnd),
+                hwnd_from_raw(guard.message_hwnd),
+                hwnd_from_raw(guard.hwnd),
+                guard.is_visible,
+            )
+        };
 
-        let title = match guard.status.mode {
-            DeviceMode::Locked => "Screen locked".to_string(),
-            DeviceMode::Unlocked => format!(
-                "Unlocked until {}",
-                guard
-                    .status
-                    .unlock_expires_at_utc
-                    .map(|time| time
-                        .with_timezone(&Local)
-                        .format("%Y-%m-%d %H:%M")
-                        .to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            ),
+        let countdown = countdown_text(&status);
+        let title = match status.mode {
+            DeviceMode::Locked if status.warn_only => "TEST MODE".to_string(),
+            DeviceMode::Locked => "SCREEN LOCKED".to_string(),
+            DeviceMode::Unlocked if status.warn_only => "TEST WINDOW ACTIVE".to_string(),
+            DeviceMode::Unlocked => "ACCESS GRANTED".to_string(),
         };
 
         let hint = format!(
-            "Remaining: {} min | Agent: {}",
-            guard.status.remaining_minutes,
-            if guard.status.agent_healthy {
+            "{}  |  Agent {}  |  Session {}",
+            if status.warn_only {
+                "Warn-only mode"
+            } else {
+                "Lock enforced"
+            },
+            if status.agent_healthy {
                 "healthy"
             } else {
                 "stale"
+            },
+            if status.protected_user_logged_in {
+                "online"
+            } else {
+                "offline"
             }
         );
+        let timer = match status.mode {
+            DeviceMode::Unlocked => countdown.clone(),
+            DeviceMode::Locked if status.warn_only => "LOCKED".to_string(),
+            DeviceMode::Locked => "00:00".to_string(),
+        };
+        let detail = match status.mode {
+            DeviceMode::Unlocked if status.warn_only => format!(
+                "Countdown running live. Lock resumes at {}.",
+                status
+                    .unlock_expires_at_utc
+                    .map(|time| time.with_timezone(&Local).format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+            DeviceMode::Unlocked => format!(
+                "Unlocked until {}. You can still enter a PIN locally if needed.",
+                status
+                    .unlock_expires_at_utc
+                    .map(|time| time.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+            DeviceMode::Locked if status.warn_only => {
+                "Lock would be enforced now, but warn-only mode keeps this as a visible preview."
+                    .to_string()
+            }
+            DeviceMode::Locked => "Parent PIN and duration are required to unlock this session."
+                .to_string(),
+        };
         let title_wide = wide(&title);
+        let timer_wide = wide(&timer);
         let hint_wide = wide(&hint);
-        let message_wide = wide(&guard.message);
+        let message_wide = wide(if message.is_empty() { &detail } else { &message });
         unsafe {
-            SetWindowTextW(guard.title_hwnd, PCWSTR(title_wide.as_ptr())).unwrap();
-            SetWindowTextW(guard.hint_hwnd, PCWSTR(hint_wide.as_ptr())).unwrap();
-            SetWindowTextW(guard.message_hwnd, PCWSTR(message_wide.as_ptr())).unwrap();
+            SetWindowTextW(title_hwnd, PCWSTR(title_wide.as_ptr())).unwrap();
+            SetWindowTextW(timer_hwnd, PCWSTR(timer_wide.as_ptr())).unwrap();
+            SetWindowTextW(hint_hwnd, PCWSTR(hint_wide.as_ptr())).unwrap();
+            SetWindowTextW(message_hwnd, PCWSTR(message_wide.as_ptr())).unwrap();
         }
 
-        if guard.status.mode == DeviceMode::Locked {
-            if !guard.is_visible {
-                unsafe { ShowWindow(guard.hwnd, SW_SHOW) };
-                guard.is_visible = true;
+        let mut is_visible = was_visible;
+        let should_show = status.mode == DeviceMode::Locked || status.warn_only;
+        if should_show {
+            if !is_visible {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                }
+                is_visible = true;
             }
+            if status.warn_only {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        40,
+                        40,
+                        WARN_ONLY_WIDTH,
+                        WARN_ONLY_HEIGHT,
+                        SWP_SHOWWINDOW,
+                    )
+                    .unwrap();
+                }
+            } else {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                    .unwrap();
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
+        } else if was_visible {
             unsafe {
-                SetWindowPos(
-                    guard.hwnd,
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
-                .unwrap();
-                SetForegroundWindow(guard.hwnd);
+                let _ = ShowWindow(hwnd, SW_HIDE);
             }
-        } else if guard.is_visible {
-            unsafe { ShowWindow(guard.hwnd, SW_HIDE) };
-            guard.is_visible = false;
+            is_visible = false;
+        }
+
+        if is_visible != was_visible {
+            if let Some(state) = UI_STATE.get() {
+                state.lock().unwrap().is_visible = is_visible;
+            }
         }
     }
 

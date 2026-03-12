@@ -9,8 +9,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use winpc_core::{AppConfig, DeviceStatus, Error, Result};
 
-const TAILSCALE_USER_LOGIN: &str = "tailscale-user-login";
-
 #[derive(Clone)]
 pub struct SharedState {
     inner: Arc<AppState>,
@@ -48,26 +46,6 @@ impl SharedState {
 
     pub async fn replace_config(&self, config: AppConfig) -> Result<()> {
         self.persist_config(config).await
-    }
-
-    pub async fn authorize_tailnet(&self, headers: &axum::http::HeaderMap) -> Result<String> {
-        let login = headers
-            .get(TAILSCALE_USER_LOGIN)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or(Error::MissingTailnetIdentity)?;
-
-        let config = self.current_config().await;
-        if config
-            .allowed_tailnet_logins
-            .iter()
-            .any(|allowed| allowed == login)
-        {
-            Ok(login.to_string())
-        } else {
-            Err(Error::UnauthorizedTailnetIdentity)
-        }
     }
 
     pub async fn verify_pin(&self, pin: &str) -> Result<()> {

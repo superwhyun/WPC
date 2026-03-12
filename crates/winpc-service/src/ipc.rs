@@ -1,9 +1,8 @@
+#[cfg(not(windows))]
 use std::future::pending;
 
 #[cfg(windows)]
 mod imp {
-    use std::sync::Arc;
-
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::windows::named_pipe::ServerOptions,
