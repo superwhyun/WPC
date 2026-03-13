@@ -19,8 +19,8 @@ use crate::{
 };
 
 const HEARTBEAT_TIMEOUT_SECS: i64 = 20;
-const MIN_DURATION_MINUTES: u16 = 0;
-const MAX_DURATION_MINUTES: u16 = 480;
+const MIN_DURATION_MINUTES: i16 = -480;
+const MAX_DURATION_MINUTES: i16 = 480;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,7 +92,7 @@ impl AppConfig {
             .map_err(|_| Error::InvalidPin)
     }
 
-    pub fn validate_duration_minutes(duration_minutes: u16) -> Result<()> {
+    pub fn validate_duration_minutes(duration_minutes: i16) -> Result<()> {
         if !(MIN_DURATION_MINUTES..=MAX_DURATION_MINUTES).contains(&duration_minutes) {
             return Err(Error::InvalidDuration);
         }
@@ -106,7 +106,7 @@ impl AppConfig {
 
     pub fn unlock_until(
         &mut self,
-        duration_minutes: u16,
+        duration_minutes: i16,
         now: DateTime<Utc>,
         expiry_action: Option<UnlockExpiryAction>,
     ) -> Result<()> {
@@ -118,7 +118,7 @@ impl AppConfig {
 
     pub fn extend_unlock(
         &mut self,
-        duration_minutes: u16,
+        duration_minutes: i16,
         now: DateTime<Utc>,
         expiry_action: Option<UnlockExpiryAction>,
     ) -> Result<()> {

@@ -44,6 +44,9 @@ Filename: "{sys}\sc.exe"; Parameters: "description {#ServiceName} ""Parental con
 Filename: "{sys}\sc.exe"; Parameters: "failure {#ServiceName} reset= 86400 actions= restart/5000/restart/15000/restart/30000"; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "failureflag {#ServiceName} 1"; Flags: runhidden
 
+; Add Windows Firewall Rule for port 46391
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""WinParentalControl Service"" dir=in action=allow protocol=TCP localport=46391"; Flags: runhidden
+
 ; Initial Config (Default PIN: 0000)
 Filename: "{app}\{#AppExeName}"; Parameters: "--init-config --all-users --pin 0000"; StatusMsg: "Initializing configuration..."; Flags: runhidden
 
@@ -63,6 +66,8 @@ Filename: "{sys}\sc.exe"; Parameters: "stop {#ServiceName}"; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "delete {#ServiceName}"; Flags: runhidden
 ; Remove Startup Entry
 Filename: "{cmd}"; Parameters: "/c del ""{commonstartup}\WinParentalControlAgent.cmd"""; Flags: runhidden
+; Remove Windows Firewall Rule
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WinParentalControl Service"""; Flags: runhidden
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{commonappdata}\{#AppName}"

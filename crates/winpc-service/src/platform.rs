@@ -129,6 +129,23 @@ mod imp {
 
     pub fn lock_active_console(expected_sid: Option<&str>) -> std::io::Result<()> {
         let rundll32 = system_path("rundll32.exe");
+        
+        // Console mode: run directly in current process (no SYSTEM permission needed)
+        if is_console_mode() {
+            if let Some(expected_sid) = expected_sid {
+                if !active_console_matches_sid(expected_sid).unwrap_or(false) {
+                    return Err(std::io::Error::other(
+                        "active console session does not match the protected user",
+                    ));
+                }
+            }
+            std::process::Command::new(&rundll32)
+                .arg("user32.dll,LockWorkStation")
+                .spawn()?;
+            return Ok(());
+        }
+        
+        // Service mode: try to run in active console session, fallback if needed
         let command_line = format!("\"{}\" user32.dll,LockWorkStation", rundll32.display());
         let can_fallback = can_run_in_current_process(expected_sid).unwrap_or(false);
         match run_in_active_console_session(expected_sid, &rundll32, &command_line, false) {

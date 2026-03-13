@@ -6,7 +6,7 @@ pub mod security;
 pub use config::AppConfig;
 pub use error::{Error, Result};
 pub use model::{
-    AgentCommandRequest, AgentCommandResponse, AuthPinRequest, AuthPinResponse, DeviceMode,
-    DeviceStatus, IpcRequest, IpcResponse, LockActionResponse, LockCommandRequest,
+    AgentCommandRequest, AgentCommandResponse, AuthPinRequest, AuthPinResponse, ChangePinRequest,
+    DeviceMode, DeviceStatus, IpcRequest, IpcResponse, LockActionResponse, LockCommandRequest,
     UnlockExpiryAction, AGENT_COMMAND_PIPE_NAME,
 };

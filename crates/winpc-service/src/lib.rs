@@ -23,8 +23,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use uuid::Uuid;
 use winpc_core::{
-    config::default_config_path, AppConfig, AuthPinRequest, AuthPinResponse, DeviceStatus, Error,
-    LockActionResponse, LockCommandRequest, UnlockExpiryAction,
+    config::default_config_path, AppConfig, AuthPinRequest, AuthPinResponse, ChangePinRequest,
+    DeviceStatus, Error, LockActionResponse, LockCommandRequest, UnlockExpiryAction,
 };
 
 use crate::{ipc::run_ipc_server, state::SharedState};
@@ -99,6 +99,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/device/status", get(get_status))
         .route("/api/auth/pin", post(auth_pin))
+        .route("/api/auth/change-pin", post(change_pin))
         .route("/api/device/unlock", post(unlock))
         .route("/api/device/extend", post(extend))
         .route("/api/device/expiry-action", post(set_expiry_action))
@@ -172,6 +173,16 @@ async fn auth_pin(
         token,
         expires_at_utc,
     }))
+}
+
+async fn change_pin(
+    State(app): State<AppContext>,
+    Json(payload): Json<ChangePinRequest>,
+) -> std::result::Result<Json<serde_json::Value>, HttpError> {
+    app.state
+        .change_pin(&payload.current_pin, &payload.new_pin)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn unlock(
@@ -332,7 +343,7 @@ async fn authorize_control(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedLockCommand {
-    duration_minutes: u16,
+    duration_minutes: i16,
     expiry_action: Option<UnlockExpiryAction>,
 }
 
@@ -358,7 +369,7 @@ fn parse_lock_command(body: &[u8]) -> std::result::Result<ParsedLockCommand, Htt
             .or_else(|| value.as_u64())
         {
             return Ok(ParsedLockCommand {
-                duration_minutes: u16::try_from(duration)
+                duration_minutes: i16::try_from(duration)
                     .map_err(|_| HttpError::from(Error::InvalidDuration))?,
                 expiry_action: value
                     .get("expiryAction")
@@ -374,7 +385,7 @@ fn parse_lock_command(body: &[u8]) -> std::result::Result<ParsedLockCommand, Htt
             .or_else(|| value.as_str())
         {
             let parsed = duration
-                .parse::<u16>()
+                .parse::<i16>()
                 .map_err(|_| HttpError::from(Error::InvalidDuration))?;
             return Ok(ParsedLockCommand {
                 duration_minutes: parsed,
@@ -399,14 +410,14 @@ fn parse_lock_command(body: &[u8]) -> std::result::Result<ParsedLockCommand, Htt
         if let Some(value) = trimmed.strip_prefix("durationMinutes=") {
             let parsed = value
                 .trim()
-                .parse::<u16>()
+                .parse::<i16>()
                 .map_err(|_| HttpError::from(Error::InvalidDuration))?;
             return Ok(ParsedLockCommand {
                 duration_minutes: parsed,
                 expiry_action: None,
             });
         }
-        if let Ok(parsed) = trimmed.parse::<u16>() {
+        if let Ok(parsed) = trimmed.parse::<i16>() {
             return Ok(ParsedLockCommand {
                 duration_minutes: parsed,
                 expiry_action: None,
@@ -416,7 +427,7 @@ fn parse_lock_command(body: &[u8]) -> std::result::Result<ParsedLockCommand, Htt
 
     Err(HttpError {
         status: StatusCode::BAD_REQUEST,
-        message: "durationMinutes must be a number between 1 and 480".to_string(),
+        message: "durationMinutes must be a number between -480 and 480".to_string(),
     })
 }
 
@@ -464,11 +475,24 @@ impl IntoResponse for HttpError {
 
 fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1).peekable();
-    if args.peek().map(String::as_str) != Some("--init-config") {
-        return Ok(false);
-    }
+    let command = args.peek().map(String::as_str);
 
-    let _ = args.next();
+    match command {
+        Some("--init-config") => {
+            let _ = args.next();
+            return init_config(args);
+        }
+        Some("--reset-pin") => {
+            let _ = args.next();
+            return reset_pin(args);
+        }
+        _ => return Ok(false),
+    }
+}
+
+fn init_config(
+    mut args: impl Iterator<Item = String>,
+) -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut config_path =
         std::env::var_os("WINPC_CONFIG_PATH").map_or_else(default_config_path, Into::into);
     let mut protected_user_sid = None;
@@ -520,6 +544,37 @@ fn try_handle_cli() -> std::result::Result<bool, Box<dyn std::error::Error + Sen
     }
     config.save(&config_path)?;
     println!("Wrote config to {}", config_path.display());
+    Ok(true)
+}
+
+fn reset_pin(
+    mut args: impl Iterator<Item = String>,
+) -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config_path =
+        std::env::var_os("WINPC_CONFIG_PATH").map_or_else(default_config_path, Into::into);
+    let mut new_pin = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                let value = args.next().ok_or("missing value for --config")?;
+                config_path = PathBuf::from(value);
+            }
+            "--pin" => {
+                new_pin = Some(args.next().ok_or("missing value for --pin")?);
+            }
+            other => {
+                return Err(format!("unsupported reset-pin argument: {other}").into());
+            }
+        }
+    }
+
+    let new_pin = new_pin.ok_or("--pin is required for --reset-pin")?;
+    let mut config = AppConfig::load(&config_path)?;
+    config.set_pin(&new_pin)?;
+    config.save(&config_path)?;
+    println!("✓ PIN has been reset successfully");
+    println!("Config saved to {}", config_path.display());
     Ok(true)
 }
 

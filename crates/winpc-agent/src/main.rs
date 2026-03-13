@@ -794,10 +794,10 @@ mod windows_app {
             .unwrap_or(false);
 
         if compact_timer {
+            // Unlock 상태: 시간 표시와 메시지만, 시간 추가 UI는 제거
             move_control(ID_TIMER_LABEL, 12, 16, width - 24, 72);
             move_control(ID_MESSAGE_LABEL, 12, 92, width - 24, 40);
-            move_control(ID_TIMER_PIN_EDIT, 12, 142, width - 130, 38);
-            move_control(ID_TIMER_EXTEND_BUTTON, width - 110, 142, 96, 38);
+            // PIN 입력과 Extend 버튼은 숨김 처리됨 (아래 set_control_visible에서)
             return;
         }
 
@@ -881,7 +881,7 @@ mod windows_app {
 
         let pin = read_control_text(pin_hwnd);
         let duration = read_control_text(duration_hwnd)
-            .parse::<u16>()
+            .parse::<i16>()
             .unwrap_or(30);
 
         let result = pipe_request(IpcRequest::LocalUnlock {
@@ -1120,8 +1120,9 @@ mod windows_app {
         set_control_visible(button_hwnd, !compact_timer);
         set_control_visible(timer_hwnd, true);
         set_control_visible(message_hwnd, true);
-        set_control_visible(timer_pin_hwnd, compact_timer);
-        set_control_visible(timer_extend_button_hwnd, compact_timer);
+        // Unlock 상태에서도 시간 추가 UI는 숨김 (웹 UI에서만 조작)
+        set_control_visible(timer_pin_hwnd, false);
+        set_control_visible(timer_extend_button_hwnd, false);
 
         let mut is_visible = was_visible;
         if !is_visible {

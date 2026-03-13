@@ -59,6 +59,13 @@ impl SharedState {
         self.inner.config.read().await.verify_pin(pin)
     }
 
+    pub async fn change_pin(&self, current_pin: &str, new_pin: &str) -> Result<()> {
+        self.verify_pin(current_pin).await?;
+        let mut config = self.inner.config.write().await.clone();
+        config.set_pin(new_pin)?;
+        self.persist_config(config).await
+    }
+
     pub async fn record_session(&self, token: String, expires_at_utc: DateTime<Utc>) {
         self.inner
             .sessions
@@ -95,7 +102,7 @@ impl SharedState {
 
     pub async fn unlock(
         &self,
-        duration_minutes: u16,
+        duration_minutes: i16,
         expiry_action: Option<UnlockExpiryAction>,
     ) -> Result<DeviceStatus> {
         self.mutate_config(|config, now| config.unlock_until(duration_minutes, now, expiry_action))
@@ -104,7 +111,7 @@ impl SharedState {
 
     pub async fn extend(
         &self,
-        duration_minutes: u16,
+        duration_minutes: i16,
         expiry_action: Option<UnlockExpiryAction>,
     ) -> Result<DeviceStatus> {
         self.mutate_config(|config, now| config.extend_unlock(duration_minutes, now, expiry_action))
@@ -141,7 +148,7 @@ impl SharedState {
     pub async fn local_unlock(
         &self,
         pin: &str,
-        duration_minutes: u16,
+        duration_minutes: i16,
         expiry_action: Option<UnlockExpiryAction>,
     ) -> Result<DeviceStatus> {
         self.verify_pin(pin).await?;

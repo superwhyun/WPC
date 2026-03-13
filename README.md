@@ -10,9 +10,10 @@ Rust workspace for a Windows-only parental control agent and service that:
 ## Workspace
 
 - `crates/winpc-core`: shared config, state transitions, DTOs, PIN hashing, DPAPI helpers
-- `crates/winpc-service`: Windows Service, localhost HTTP API, IPC server
+- `crates/winpc-service`: Windows Service, HTTP API (port 46391), IPC server
 - `crates/winpc-agent`: child-session lock overlay and local PIN unlock UI
-- `scripts/`: installation and setup helpers for Windows
+- `scripts/`: PowerShell installation and setup helpers
+- `WPC_Installer.iss`: Inno Setup script for automated installer generation
 
 ## Current shape
 
@@ -61,6 +62,30 @@ In another interactive user session, run:
 
 ## Install on Windows
 
+### Option 1: Installer (Recommended)
+
+1. Build the release binaries:
+   ```powershell
+   cargo build --release
+   ```
+
+2. Create the installer using Inno Setup:
+   - Install [Inno Setup](https://jrsoftware.org/isinfo.php)
+   - Compile `WPC_Installer.iss`
+   - Run the generated `WPC_Setup.exe`
+
+**The installer automatically:**
+- ✅ Installs service and agent to `C:\Program Files\WinParentalControl`
+- ✅ Registers Windows Service with auto-start on boot
+- ✅ Configures agent to auto-start for all users on login
+- ✅ Opens Windows Firewall for port 46391 (TCP inbound)
+- ✅ Sets up service recovery to auto-restart on crash (5s/15s/30s delays)
+- ✅ Initializes default configuration with PIN: `0000`
+- ✅ Starts the service immediately
+- ✅ Clean uninstall removes all files, service, firewall rules, and startup entries
+
+### Option 2: Manual Installation (PowerShell Scripts)
+
 1. Build the release binaries on Windows.
 2. Run `scripts/install-agent.ps1`.
 3. Run `scripts/install-service.ps1`.
@@ -74,12 +99,61 @@ Example:
   -Pin 4321
 ```
 
+## PIN Management
+
+### Changing PIN
+
+You can change your PIN through the web interface:
+1. Navigate to `http://localhost:46391` (or from another device on the network)
+2. Go to the "Security Settings" section
+3. Enter your current PIN, new PIN, and confirm the new PIN
+4. Click "Change PIN"
+
+### PIN Recovery (If You Forgot Your PIN)
+
+If you forget your PIN, you have several recovery options:
+
+#### Option 1: Using Command Line (Recommended)
+Run as Administrator:
+```powershell
+# Stop the service first
+sc stop WinParentalControlService
+
+# Reset PIN to a new value
+cd "C:\Program Files\WinParentalControl"
+.\winpc-service.exe --reset-pin --pin YOUR_NEW_PIN
+
+# Start the service
+sc start WinParentalControlService
+```
+
+#### Option 2: Delete Configuration File
+Run as Administrator:
+```powershell
+# Stop the service
+sc stop WinParentalControlService
+
+# Delete the config file (will reset to default PIN: 0000)
+del "C:\ProgramData\WinParentalControl\config.json"
+
+# Start the service
+sc start WinParentalControlService
+```
+
+After recovery, the default PIN will be `0000` (Option 2) or your specified new PIN (Option 1).
+
 ## Notes
 
-- The service listens on `127.0.0.1:46391` by default.
-- Remaining time is owned by the service and persisted in `config.json`; the agent only renders the service state and sends heartbeats.
-- Parent unlock/extend requests can choose the timeout follow-up action: `app_lock`, `windows_lock`, or `shutdown`.
-- Parent controls can also immediately apply `App Lock`, `Windows Lock`, or `Windows Shutdown` without waiting for the timer.
-- The service supervisor relaunches the agent for the active console session when heartbeats go stale, and the install script configures Windows Service recovery to restart the service after unexpected termination.
-- The Windows-specific code paths were not executed in this macOS workspace. Only the shared/core and non-Windows build paths were tested here with `cargo test`.
-- The current agent implementation uses one topmost window across the full virtual desktop, which covers multi-monitor setups through the virtual screen bounds.
+- **Network**: The service listens on `0.0.0.0:46391` and is accessible from the local network. The installer automatically creates a Windows Firewall rule to allow TCP port 46391 inbound.
+- **State Management**: Remaining time is owned by the service and persisted in `config.json`; the agent only renders the service state and sends heartbeats.
+- **Unlock Actions**: Parent unlock/extend requests can choose the timeout follow-up action: `app_lock`, `windows_lock`, or `shutdown`.
+- **Immediate Controls**: Parent controls can also immediately apply `App Lock`, `Windows Lock`, or `Windows Shutdown` without waiting for the timer.
+- **Auto-Recovery**:
+  - The service supervisor relaunches the agent for the active console session when heartbeats go stale.
+  - Windows Service recovery automatically restarts the service after crashes (5s → 15s → 30s delays).
+  - If the service process is killed (e.g., via Task Manager), Windows will automatically restart it.
+- **Auto-Start**:
+  - The service starts automatically on system boot (Windows Service with `start=auto`).
+  - The agent starts automatically for all users on login (via Common Startup folder).
+- **Testing**: The Windows-specific code paths were not executed in this macOS workspace. Only the shared/core and non-Windows build paths were tested here with `cargo test`.
+- **Multi-Monitor**: The current agent implementation uses one topmost window across the full virtual desktop, which covers multi-monitor setups through the virtual screen bounds.

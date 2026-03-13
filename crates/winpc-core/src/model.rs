@@ -51,8 +51,15 @@ pub struct AuthPinResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChangePinRequest {
+    pub current_pin: String,
+    pub new_pin: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LockCommandRequest {
-    pub duration_minutes: u16,
+    pub duration_minutes: i16,
     #[serde(default)]
     pub expiry_action: Option<UnlockExpiryAction>,
 }
@@ -70,13 +77,13 @@ pub enum IpcRequest {
     Heartbeat,
     LocalUnlock {
         pin: String,
-        duration_minutes: u16,
+        duration_minutes: i16,
         #[serde(default)]
         expiry_action: Option<UnlockExpiryAction>,
     },
     LocalExtend {
         pin: String,
-        duration_minutes: u16,
+        duration_minutes: i16,
         #[serde(default)]
         expiry_action: Option<UnlockExpiryAction>,
     },
