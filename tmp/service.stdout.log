@@ -1,6 +1,0 @@
-[33m WARN[0m [2mwinpc_service::platform::imp[0m[2m:[0m unlock timer expired; app lock is active again
-[33m WARN[0m [2mwinpc_service::state[0m[2m:[0m agent heartbeat is stale
-[33m WARN[0m [2mwinpc_service::platform::imp[0m[2m:[0m agent is unhealthy; attempting to launch winpc-agent [3mactive_console_sid[0m[2m=[0mSome("S-1-5-21-3699431592-3358211645-2655340277-1001") [3mprotected_sid[0m[2m=[0mNone
-[33m WARN[0m [2mwinpc_service::platform::imp[0m[2m:[0m launching winpc-agent directly in the current console session [3magent_path[0m[2m=[0mC:\Users\USER\workspace\WPC\target\release\winpc-agent.exe [3mexpected_sid[0m[2m=[0mNone
-[33m WARN[0m [2mwinpc_service::platform::imp[0m[2m:[0m spawned winpc-agent in current console session
-[33m WARN[0m [2mwinpc_service::platform::imp[0m[2m:[0m unlock timer expired; app lock is active again
