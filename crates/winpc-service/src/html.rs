@@ -886,42 +886,54 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 
     // ── UNLOCK ──
     document.getElementById("unlock-btn").addEventListener("click", async function() {
+      const pinEl = document.getElementById("pin");
+      const pin = pinEl.value;
+      const durHint = document.getElementById("duration").value || "30";
+      const dur = Number.parseInt(durHint, 10);
+      const act = document.getElementById("expiry-action").value;
+
       try {
-        var pin = document.getElementById("pin").value;
-        var dur = Number.parseInt(document.getElementById("duration").value || "30", 10);
-        var act = document.getElementById("expiry-action").value;
         if (!Number.isFinite(dur) || dur < -480 || dur > 480) throw new Error("Duration: -480 to 480 min");
 
         await auth(pin);
-        var result = await request("/api/device/unlock", {
+        await request("/api/device/unlock", {
           method: "POST",
           body: JSON.stringify({ durationMinutes: dur, expiryAction: act })
         });
         setMessage("Unlocked for " + dur + " min \u2192 " + expiryActionLabel(act));
-        document.getElementById("pin").value = "";
         await refresh();
-      } catch (error) { setMessage(error.message, true); }
+      } catch (error) {
+        setMessage(error.message, true);
+      } finally {
+        pinEl.value = "";
+      }
     });
 
     // ── EXTEND ──
     document.getElementById("extend-btn").addEventListener("click", async function() {
+      const pinEl = document.getElementById("pin-extend");
+      const pin = pinEl.value;
+      const durHint = document.getElementById("duration-extend").value || "30";
+      const dur = Number.parseInt(durHint, 10);
+      const act = document.getElementById("expiry-action-extend").value;
+
       try {
-        var pin = document.getElementById("pin-extend").value;
-        var dur = Number.parseInt(document.getElementById("duration-extend").value || "30", 10);
-        var act = document.getElementById("expiry-action-extend").value;
         if (!Number.isFinite(dur) || dur < -480 || dur > 480) throw new Error("Duration: -480 to 480 min");
 
         if (!token && pin) await auth(pin);
         await ensureAuth();
-        var result = await request("/api/device/extend", {
+        await request("/api/device/extend", {
           method: "POST",
           body: JSON.stringify({ durationMinutes: dur, expiryAction: act })
         });
         setMessage("Extended by " + dur + " min \u2192 " + expiryActionLabel(act));
-        document.getElementById("pin-extend").value = "";
         totalDurationMs = null;
         await refresh();
-      } catch (error) { setMessage(error.message, true); }
+      } catch (error) {
+        setMessage(error.message, true);
+      } finally {
+        pinEl.value = "";
+      }
     });
 
     // ── LOCK NOW (in unlocked view) ──
