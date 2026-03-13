@@ -13,13 +13,13 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::{DeviceMode, DeviceStatus},
+    model::{DeviceMode, DeviceStatus, UnlockExpiryAction},
     security::{seal_bytes, unseal_bytes},
     Error, Result,
 };
 
 const HEARTBEAT_TIMEOUT_SECS: i64 = 20;
-const MIN_DURATION_MINUTES: u16 = 1;
+const MIN_DURATION_MINUTES: u16 = 0;
 const MAX_DURATION_MINUTES: u16 = 480;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub warn_only: bool,
     pub unlock_expires_at_utc: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub unlock_expiry_action: Option<UnlockExpiryAction>,
     pub last_agent_heartbeat_utc: Option<DateTime<Utc>>,
 }
 
@@ -40,6 +42,7 @@ impl Default for AppConfig {
             pin_hash: None,
             warn_only: false,
             unlock_expires_at_utc: None,
+            unlock_expiry_action: None,
             last_agent_heartbeat_utc: None,
         }
     }
@@ -98,19 +101,48 @@ impl AppConfig {
 
     pub fn lock(&mut self) {
         self.unlock_expires_at_utc = None;
+        self.unlock_expiry_action = None;
     }
 
-    pub fn unlock_until(&mut self, duration_minutes: u16, now: DateTime<Utc>) -> Result<()> {
+    pub fn unlock_until(
+        &mut self,
+        duration_minutes: u16,
+        now: DateTime<Utc>,
+        expiry_action: Option<UnlockExpiryAction>,
+    ) -> Result<()> {
         Self::validate_duration_minutes(duration_minutes)?;
         self.unlock_expires_at_utc = Some(now + Duration::minutes(duration_minutes as i64));
+        self.unlock_expiry_action = Some(expiry_action.unwrap_or_default());
         Ok(())
     }
 
-    pub fn extend_unlock(&mut self, duration_minutes: u16, now: DateTime<Utc>) -> Result<()> {
+    pub fn extend_unlock(
+        &mut self,
+        duration_minutes: u16,
+        now: DateTime<Utc>,
+        expiry_action: Option<UnlockExpiryAction>,
+    ) -> Result<()> {
         Self::validate_duration_minutes(duration_minutes)?;
         let baseline = self.unlock_expires_at_utc.unwrap_or(now).max(now);
         self.unlock_expires_at_utc = Some(baseline + Duration::minutes(duration_minutes as i64));
+        self.unlock_expiry_action =
+            Some(expiry_action.unwrap_or_else(|| self.unlock_expiry_action.unwrap_or_default()));
         Ok(())
+    }
+
+    pub fn set_unlock_expiry_action(&mut self, expiry_action: UnlockExpiryAction) {
+        self.unlock_expiry_action = Some(expiry_action);
+    }
+
+    pub fn take_expired_unlock_action(&mut self, now: DateTime<Utc>) -> Option<UnlockExpiryAction> {
+        let expires_at = self.unlock_expires_at_utc?;
+        if expires_at > now {
+            return None;
+        }
+
+        let action = self.unlock_expiry_action.unwrap_or_default();
+        self.lock();
+        Some(action)
     }
 
     pub fn record_heartbeat(&mut self, now: DateTime<Utc>) {
@@ -149,6 +181,10 @@ impl AppConfig {
             unlock_expires_at_utc: self
                 .unlock_expires_at_utc
                 .filter(|expires_at| *expires_at > now),
+            unlock_expiry_action: self
+                .unlock_expires_at_utc
+                .filter(|expires_at| *expires_at > now)
+                .and(self.unlock_expiry_action),
             remaining_minutes: self.remaining_minutes(now),
             agent_healthy: self.agent_healthy(now),
             protected_user_logged_in,
@@ -179,6 +215,7 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::AppConfig;
+    use crate::UnlockExpiryAction;
 
     #[test]
     fn pin_roundtrip() {
@@ -194,11 +231,21 @@ mod tests {
         let now = Utc::now();
         let mut config = AppConfig::default();
 
-        config.unlock_until(30, now).unwrap();
+        config
+            .unlock_until(30, now, Some(UnlockExpiryAction::WindowsLock))
+            .unwrap();
         assert_eq!(config.remaining_minutes(now), 30);
+        assert_eq!(
+            config.unlock_expiry_action,
+            Some(UnlockExpiryAction::WindowsLock)
+        );
 
-        config.extend_unlock(30, now).unwrap();
+        config.extend_unlock(30, now, None).unwrap();
         assert_eq!(config.remaining_minutes(now), 60);
+        assert_eq!(
+            config.unlock_expiry_action,
+            Some(UnlockExpiryAction::WindowsLock)
+        );
     }
 
     #[test]
@@ -207,10 +254,27 @@ mod tests {
         let config = AppConfig {
             warn_only: false,
             unlock_expires_at_utc: Some(now - Duration::minutes(1)),
+            unlock_expiry_action: Some(UnlockExpiryAction::Shutdown),
             ..AppConfig::default()
         };
 
         assert_eq!(config.remaining_minutes(now), 0);
         assert_eq!(config.effective_mode(now), crate::model::DeviceMode::Locked);
+    }
+
+    #[test]
+    fn take_expired_unlock_action_clears_unlock_state() {
+        let now = Utc::now();
+        let mut config = AppConfig {
+            unlock_expires_at_utc: Some(now - Duration::minutes(1)),
+            unlock_expiry_action: Some(UnlockExpiryAction::WindowsLock),
+            ..AppConfig::default()
+        };
+
+        let action = config.take_expired_unlock_action(now);
+
+        assert_eq!(action, Some(UnlockExpiryAction::WindowsLock));
+        assert_eq!(config.unlock_expires_at_utc, None);
+        assert_eq!(config.unlock_expiry_action, None);
     }
 }

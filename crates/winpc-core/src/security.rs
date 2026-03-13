@@ -3,7 +3,7 @@ mod imp {
     use std::{ptr::null_mut, slice};
 
     use windows::Win32::{
-        Foundation::{HLOCAL, LocalFree},
+        Foundation::{LocalFree, HLOCAL},
         Security::Cryptography::{
             CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
         },
@@ -74,5 +74,3 @@ mod imp {
 }
 
 pub use imp::{seal_bytes, unseal_bytes};
-
-

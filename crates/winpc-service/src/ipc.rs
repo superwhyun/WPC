@@ -48,8 +48,27 @@ mod imp {
             IpcRequest::LocalUnlock {
                 pin,
                 duration_minutes,
-            } => match state.local_unlock(&pin, duration_minutes).await {
+                expiry_action,
+            } => match state
+                .local_unlock(&pin, duration_minutes, expiry_action)
+                .await
+            {
                 Ok(status) => IpcResponse::Ack(status),
+                Err(error) => IpcResponse::Error {
+                    message: error.to_string(),
+                },
+            },
+            IpcRequest::LocalExtend {
+                pin,
+                duration_minutes,
+                expiry_action,
+            } => match state.verify_pin(&pin).await {
+                Ok(()) => match state.extend(duration_minutes, expiry_action).await {
+                    Ok(status) => IpcResponse::Ack(status),
+                    Err(error) => IpcResponse::Error {
+                        message: error.to_string(),
+                    },
+                },
                 Err(error) => IpcResponse::Error {
                     message: error.to_string(),
                 },

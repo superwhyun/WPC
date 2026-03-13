@@ -8,12 +8,28 @@ pub enum DeviceMode {
     Unlocked,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockExpiryAction {
+    #[serde(alias = "agent_lock")]
+    AppLock,
+    WindowsLock,
+    Shutdown,
+}
+
+impl Default for UnlockExpiryAction {
+    fn default() -> Self {
+        Self::AppLock
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceStatus {
     pub mode: DeviceMode,
     pub warn_only: bool,
     pub unlock_expires_at_utc: Option<DateTime<Utc>>,
+    pub unlock_expiry_action: Option<UnlockExpiryAction>,
     pub remaining_minutes: u64,
     pub agent_healthy: bool,
     pub protected_user_logged_in: bool,
@@ -37,6 +53,8 @@ pub struct AuthPinResponse {
 #[serde(rename_all = "camelCase")]
 pub struct LockCommandRequest {
     pub duration_minutes: u16,
+    #[serde(default)]
+    pub expiry_action: Option<UnlockExpiryAction>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,7 +68,18 @@ pub struct LockActionResponse {
 pub enum IpcRequest {
     GetState,
     Heartbeat,
-    LocalUnlock { pin: String, duration_minutes: u16 },
+    LocalUnlock {
+        pin: String,
+        duration_minutes: u16,
+        #[serde(default)]
+        expiry_action: Option<UnlockExpiryAction>,
+    },
+    LocalExtend {
+        pin: String,
+        duration_minutes: u16,
+        #[serde(default)]
+        expiry_action: Option<UnlockExpiryAction>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

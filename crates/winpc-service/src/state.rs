@@ -7,7 +7,7 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
-use winpc_core::{AppConfig, DeviceStatus, Error, Result};
+use winpc_core::{AppConfig, DeviceStatus, Error, Result, UnlockExpiryAction};
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -20,6 +20,13 @@ pub struct AppState {
     sessions: Mutex<HashMap<String, DateTime<Utc>>>,
     protected_user_logged_in: RwLock<bool>,
     last_spawn_attempt: Mutex<Option<DateTime<Utc>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingExpiryAction {
+    pub action: UnlockExpiryAction,
+    pub warn_only: bool,
+    pub protected_user_sid: Option<String>,
 }
 
 impl SharedState {
@@ -76,14 +83,43 @@ impl SharedState {
         config.status(now, *self.inner.protected_user_logged_in.read().await)
     }
 
-    pub async fn unlock(&self, duration_minutes: u16) -> Result<DeviceStatus> {
-        self.mutate_config(|config, now| config.unlock_until(duration_minutes, now))
+    pub async fn clear_saved_agent_heartbeat(&self) -> Result<bool> {
+        let mut config = self.current_config().await;
+        let had_heartbeat = config.last_agent_heartbeat_utc.is_some();
+        if had_heartbeat {
+            config.last_agent_heartbeat_utc = None;
+            self.persist_config(config).await?;
+        }
+        Ok(had_heartbeat)
+    }
+
+    pub async fn unlock(
+        &self,
+        duration_minutes: u16,
+        expiry_action: Option<UnlockExpiryAction>,
+    ) -> Result<DeviceStatus> {
+        self.mutate_config(|config, now| config.unlock_until(duration_minutes, now, expiry_action))
             .await
     }
 
-    pub async fn extend(&self, duration_minutes: u16) -> Result<DeviceStatus> {
-        self.mutate_config(|config, now| config.extend_unlock(duration_minutes, now))
+    pub async fn extend(
+        &self,
+        duration_minutes: u16,
+        expiry_action: Option<UnlockExpiryAction>,
+    ) -> Result<DeviceStatus> {
+        self.mutate_config(|config, now| config.extend_unlock(duration_minutes, now, expiry_action))
             .await
+    }
+
+    pub async fn set_expiry_action(
+        &self,
+        expiry_action: UnlockExpiryAction,
+    ) -> Result<DeviceStatus> {
+        self.mutate_config(|config, _| {
+            config.set_unlock_expiry_action(expiry_action);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn lock(&self) -> Result<DeviceStatus> {
@@ -102,9 +138,14 @@ impl SharedState {
         .await
     }
 
-    pub async fn local_unlock(&self, pin: &str, duration_minutes: u16) -> Result<DeviceStatus> {
+    pub async fn local_unlock(
+        &self,
+        pin: &str,
+        duration_minutes: u16,
+        expiry_action: Option<UnlockExpiryAction>,
+    ) -> Result<DeviceStatus> {
         self.verify_pin(pin).await?;
-        self.unlock(duration_minutes).await
+        self.unlock(duration_minutes, expiry_action).await
     }
 
     pub async fn set_protected_user_logged_in(&self, value: bool) {
@@ -120,6 +161,22 @@ impl SharedState {
             *guard = Some(now);
         }
         can_retry
+    }
+
+    pub async fn take_pending_expiry_action(&self) -> Result<Option<PendingExpiryAction>> {
+        let now = Utc::now();
+        let mut config = self.inner.config.write().await.clone();
+        let Some(action) = config.take_expired_unlock_action(now) else {
+            return Ok(None);
+        };
+
+        let pending = PendingExpiryAction {
+            action,
+            warn_only: config.warn_only,
+            protected_user_sid: config.protected_user_sid.clone(),
+        };
+        self.persist_config(config).await?;
+        Ok(Some(pending))
     }
 
     async fn mutate_config<F>(&self, f: F) -> Result<DeviceStatus>
@@ -148,5 +205,33 @@ impl SharedState {
             warn!("agent heartbeat is stale");
         }
         status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use winpc_core::AppConfig;
+
+    use super::SharedState;
+
+    #[tokio::test]
+    async fn clears_saved_agent_heartbeat() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = SharedState::load(tempdir.path().join("config.json"))
+            .await
+            .unwrap();
+
+        let mut config = AppConfig::default();
+        config.record_heartbeat(Utc::now());
+        state.replace_config(config).await.unwrap();
+
+        assert!(state.clear_saved_agent_heartbeat().await.unwrap());
+        assert!(state
+            .current_config()
+            .await
+            .last_agent_heartbeat_utc
+            .is_none());
+        assert!(!state.clear_saved_agent_heartbeat().await.unwrap());
     }
 }

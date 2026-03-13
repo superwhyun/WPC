@@ -18,48 +18,23 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
 use winpc_core::{
     config::default_config_path, AppConfig, AuthPinRequest, AuthPinResponse, DeviceStatus, Error,
-    LockActionResponse, LockCommandRequest,
+    LockActionResponse, LockCommandRequest, UnlockExpiryAction,
 };
 
 use crate::{ipc::run_ipc_server, state::SharedState};
 
-const LISTEN_ADDR: &str = "127.0.0.1:46391";
+const LISTEN_ADDR: &str = "0.0.0.0:46391";
 const SESSION_TTL_MINUTES: i64 = 10;
-
-#[derive(Clone)]
-struct ShutdownHandle {
-    sender: watch::Sender<bool>,
-}
-
-impl ShutdownHandle {
-    fn new() -> Self {
-        let (sender, _) = watch::channel(false);
-        Self { sender }
-    }
-
-    fn request_shutdown(&self) {
-        let _ = self.sender.send(true);
-    }
-
-    async fn wait_for_shutdown(&self) {
-        let mut receiver = self.sender.subscribe();
-        if *receiver.borrow() {
-            return;
-        }
-        let _ = receiver.changed().await;
-    }
-}
 
 #[derive(Clone)]
 struct AppContext {
     state: SharedState,
-    shutdown: ShutdownHandle,
 }
 
 pub fn init_tracing() {
@@ -96,10 +71,12 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let state = SharedState::load(config_path).await?;
-    let shutdown_handle = ShutdownHandle::new();
+    if state.clear_saved_agent_heartbeat().await? {
+        info!("cleared saved agent heartbeat on startup for immediate supervision");
+    }
     let supervisor = tokio::spawn(supervisor_loop(state.clone()));
     let mut ipc = tokio::spawn(run_ipc_server(state.clone()));
-    let mut http = tokio::spawn(run_http_server(state, shutdown, shutdown_handle));
+    let mut http = tokio::spawn(run_http_server(state, shutdown));
 
     tokio::select! {
         result = &mut http => {
@@ -117,10 +94,6 @@ where
 }
 
 pub fn build_router(state: SharedState) -> Router {
-    build_router_with_shutdown(state, ShutdownHandle::new())
-}
-
-fn build_router_with_shutdown(state: SharedState, shutdown_handle: ShutdownHandle) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -128,36 +101,27 @@ fn build_router_with_shutdown(state: SharedState, shutdown_handle: ShutdownHandl
         .route("/api/auth/pin", post(auth_pin))
         .route("/api/device/unlock", post(unlock))
         .route("/api/device/extend", post(extend))
+        .route("/api/device/expiry-action", post(set_expiry_action))
         .route("/api/device/lock", post(lock))
         .route("/api/device/windows-lock", post(windows_lock))
         .route("/api/device/shutdown", post(shutdown))
         .route("/api/device/snapshot", get(snapshot))
-        .route("/api/service/stop", post(stop_service))
-        .with_state(AppContext {
-            state,
-            shutdown: shutdown_handle,
-        })
+        .with_state(AppContext { state })
 }
 
 async fn run_http_server<S>(
     state: SharedState,
     shutdown: S,
-    internal_shutdown: ShutdownHandle,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: Future<Output = ()> + Send + 'static,
 {
-    let app = build_router_with_shutdown(state, internal_shutdown.clone());
+    let app = build_router(state);
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     let local_addr = listener.local_addr()?;
     info!("HTTP control plane listening on {local_addr}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = shutdown => {}
-                _ = internal_shutdown.wait_for_shutdown() => {}
-            }
-        })
+        .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
 }
@@ -216,7 +180,54 @@ async fn unlock(
     body: Bytes,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
     authorize_control(&app.state, &headers).await?;
-    let status = app.state.unlock(parse_duration_minutes(&body)?).await?;
+    let command = parse_lock_command(&body)?;
+
+    // Duration 0: 즉시 expiry_action 실행
+    if command.duration_minutes == 0 {
+        let expiry_action = command.expiry_action.ok_or_else(|| HttpError {
+            status: StatusCode::BAD_REQUEST,
+            message: "expiryAction is required when duration is 0".to_string(),
+        })?;
+
+        let config = app.state.current_config().await;
+        let expected_sid = config.protected_user_sid;
+
+        match expiry_action {
+            UnlockExpiryAction::AppLock => {
+                // App Lock: config를 locked 상태로 변경
+                let status = app.state.lock().await?;
+                return Ok(Json(LockActionResponse { status }));
+            }
+            UnlockExpiryAction::WindowsLock => {
+                // Windows Lock 즉시 실행
+                tokio::task::spawn_blocking(move || {
+                    platform::lock_active_console(expected_sid.as_deref())
+                })
+                .await
+                .map_err(|error| HttpError::internal(error.to_string()))?
+                .map_err(|error| HttpError::internal(error.to_string()))?;
+
+                let status = app.state.device_status().await;
+                return Ok(Json(LockActionResponse { status }));
+            }
+            UnlockExpiryAction::Shutdown => {
+                // Shutdown 즉시 실행
+                tokio::task::spawn_blocking(platform::shutdown_machine)
+                    .await
+                    .map_err(|error| HttpError::internal(error.to_string()))?
+                    .map_err(|error| HttpError::internal(error.to_string()))?;
+
+                let status = app.state.device_status().await;
+                return Ok(Json(LockActionResponse { status }));
+            }
+        }
+    }
+
+    // Duration > 0: 기존 unlock 로직
+    let status = app
+        .state
+        .unlock(command.duration_minutes, command.expiry_action)
+        .await?;
     Ok(Json(LockActionResponse { status }))
 }
 
@@ -226,7 +237,27 @@ async fn extend(
     body: Bytes,
 ) -> std::result::Result<Json<LockActionResponse>, HttpError> {
     authorize_control(&app.state, &headers).await?;
-    let status = app.state.extend(parse_duration_minutes(&body)?).await?;
+    let command = parse_lock_command(&body)?;
+    let status = app
+        .state
+        .extend(command.duration_minutes, command.expiry_action)
+        .await?;
+    Ok(Json(LockActionResponse { status }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpiryActionRequest {
+    expiry_action: UnlockExpiryAction,
+}
+
+async fn set_expiry_action(
+    State(app): State<AppContext>,
+    headers: HeaderMap,
+    Json(payload): Json<ExpiryActionRequest>,
+) -> std::result::Result<Json<LockActionResponse>, HttpError> {
+    authorize_control(&app.state, &headers).await?;
+    let status = app.state.set_expiry_action(payload.expiry_action).await?;
     Ok(Json(LockActionResponse { status }))
 }
 
@@ -284,19 +315,6 @@ async fn snapshot(
         .into_response())
 }
 
-async fn stop_service(
-    State(app): State<AppContext>,
-    Json(payload): Json<AuthPinRequest>,
-) -> std::result::Result<Json<serde_json::Value>, HttpError> {
-    app.state.verify_pin(&payload.pin).await?;
-    let shutdown = app.shutdown.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        shutdown.request_shutdown();
-    });
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
 async fn authorize_control(
     state: &SharedState,
     headers: &HeaderMap,
@@ -312,13 +330,25 @@ async fn authorize_control(
     Ok(())
 }
 
-fn parse_duration_minutes(body: &[u8]) -> std::result::Result<u16, HttpError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedLockCommand {
+    duration_minutes: u16,
+    expiry_action: Option<UnlockExpiryAction>,
+}
+
+fn parse_lock_command(body: &[u8]) -> std::result::Result<ParsedLockCommand, HttpError> {
     if body.is_empty() {
-        return Ok(30);
+        return Ok(ParsedLockCommand {
+            duration_minutes: 30,
+            expiry_action: None,
+        });
     }
 
     if let Ok(payload) = serde_json::from_slice::<LockCommandRequest>(body) {
-        return Ok(payload.duration_minutes);
+        return Ok(ParsedLockCommand {
+            duration_minutes: payload.duration_minutes,
+            expiry_action: payload.expiry_action,
+        });
     }
 
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
@@ -327,7 +357,16 @@ fn parse_duration_minutes(body: &[u8]) -> std::result::Result<u16, HttpError> {
             .and_then(|v| v.as_u64())
             .or_else(|| value.as_u64())
         {
-            return u16::try_from(duration).map_err(|_| HttpError::from(Error::InvalidDuration));
+            return Ok(ParsedLockCommand {
+                duration_minutes: u16::try_from(duration)
+                    .map_err(|_| HttpError::from(Error::InvalidDuration))?,
+                expiry_action: value
+                    .get("expiryAction")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| HttpError::from(Error::InvalidDuration))?,
+            });
         }
         if let Some(duration) = value
             .get("durationMinutes")
@@ -337,24 +376,41 @@ fn parse_duration_minutes(body: &[u8]) -> std::result::Result<u16, HttpError> {
             let parsed = duration
                 .parse::<u16>()
                 .map_err(|_| HttpError::from(Error::InvalidDuration))?;
-            return Ok(parsed);
+            return Ok(ParsedLockCommand {
+                duration_minutes: parsed,
+                expiry_action: value
+                    .get("expiryAction")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| HttpError::from(Error::InvalidDuration))?,
+            });
         }
     }
 
     if let Ok(text) = std::str::from_utf8(body) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            return Ok(30);
+            return Ok(ParsedLockCommand {
+                duration_minutes: 30,
+                expiry_action: None,
+            });
         }
         if let Some(value) = trimmed.strip_prefix("durationMinutes=") {
             let parsed = value
                 .trim()
                 .parse::<u16>()
                 .map_err(|_| HttpError::from(Error::InvalidDuration))?;
-            return Ok(parsed);
+            return Ok(ParsedLockCommand {
+                duration_minutes: parsed,
+                expiry_action: None,
+            });
         }
         if let Ok(parsed) = trimmed.parse::<u16>() {
-            return Ok(parsed);
+            return Ok(ParsedLockCommand {
+                duration_minutes: parsed,
+                expiry_action: None,
+            });
         }
     }
 
@@ -527,13 +583,61 @@ mod tests {
     #[test]
     fn duration_parser_accepts_json_and_form_shapes() {
         assert_eq!(
-            parse_duration_minutes(br#"{"durationMinutes":30}"#).unwrap(),
-            30
+            parse_lock_command(br#"{"durationMinutes":30}"#).unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 30,
+                expiry_action: None,
+            }
         );
-        assert_eq!(parse_duration_minutes(br#""45""#).unwrap(), 45);
-        assert_eq!(parse_duration_minutes(br#"15"#).unwrap(), 15);
-        assert_eq!(parse_duration_minutes(b"durationMinutes=20").unwrap(), 20);
-        assert_eq!(parse_duration_minutes(b"").unwrap(), 30);
+        assert_eq!(
+            parse_lock_command(br#"{"durationMinutes":45,"expiryAction":"shutdown"}"#).unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 45,
+                expiry_action: Some(UnlockExpiryAction::Shutdown),
+            }
+        );
+        assert_eq!(
+            parse_lock_command(br#"{"durationMinutes":15,"expiryAction":"app_lock"}"#).unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 15,
+                expiry_action: Some(UnlockExpiryAction::AppLock),
+            }
+        );
+        assert_eq!(
+            parse_lock_command(br#"{"durationMinutes":15,"expiryAction":"agent_lock"}"#).unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 15,
+                expiry_action: Some(UnlockExpiryAction::AppLock),
+            }
+        );
+        assert_eq!(
+            parse_lock_command(br#""45""#).unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 45,
+                expiry_action: None,
+            }
+        );
+        assert_eq!(
+            parse_lock_command(br#"15"#).unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 15,
+                expiry_action: None,
+            }
+        );
+        assert_eq!(
+            parse_lock_command(b"durationMinutes=20").unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 20,
+                expiry_action: None,
+            }
+        );
+        assert_eq!(
+            parse_lock_command(b"").unwrap(),
+            ParsedLockCommand {
+                duration_minutes: 30,
+                expiry_action: None,
+            }
+        );
     }
 
     #[tokio::test]
@@ -556,43 +660,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn service_stop_requires_valid_pin() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let state = SharedState::load(tempdir.path().join("config.json"))
-            .await
-            .unwrap();
-
-        let mut config = AppConfig::default();
-        config.set_pin("1234").unwrap();
-        state.replace_config(config).await.unwrap();
-
-        let unauthorized = build_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/service/stop")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"pin":"9999"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-        let authorized = build_router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/service/stop")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"pin":"1234"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(authorized.status(), StatusCode::OK);
     }
 }

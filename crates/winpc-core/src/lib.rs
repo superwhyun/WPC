@@ -8,5 +8,5 @@ pub use error::{Error, Result};
 pub use model::{
     AgentCommandRequest, AgentCommandResponse, AuthPinRequest, AuthPinResponse, DeviceMode,
     DeviceStatus, IpcRequest, IpcResponse, LockActionResponse, LockCommandRequest,
-    AGENT_COMMAND_PIPE_NAME,
+    UnlockExpiryAction, AGENT_COMMAND_PIPE_NAME,
 };

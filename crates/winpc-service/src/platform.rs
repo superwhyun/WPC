@@ -45,10 +45,11 @@ mod imp {
         service_dispatcher,
     };
     use winpc_core::{
-        AgentCommandRequest, AgentCommandResponse, Error, Result, AGENT_COMMAND_PIPE_NAME,
+        AgentCommandRequest, AgentCommandResponse, Error, Result, UnlockExpiryAction,
+        AGENT_COMMAND_PIPE_NAME,
     };
 
-    use crate::state::SharedState;
+    use crate::state::{PendingExpiryAction, SharedState};
 
     const SERVICE_NAME: &str = "WinParentalControlService";
 
@@ -84,6 +85,9 @@ mod imp {
         };
 
         state.set_protected_user_logged_in(is_logged_in).await;
+        if let Some(pending) = state.take_pending_expiry_action().await? {
+            perform_pending_expiry_action(pending)?;
+        }
         let status = state.mark_agent_unhealthy_if_needed().await;
         if is_logged_in && !status.agent_healthy && state.should_retry_agent_spawn(Utc::now()).await
         {
@@ -96,6 +100,31 @@ mod imp {
         }
 
         Ok(())
+    }
+
+    fn perform_pending_expiry_action(pending: PendingExpiryAction) -> std::io::Result<()> {
+        if pending.warn_only {
+            warn!(
+                action = ?pending.action,
+                "unlock timer expired in warn-only mode; skipping follow-up action"
+            );
+            return Ok(());
+        }
+
+        match pending.action {
+            UnlockExpiryAction::AppLock => {
+                warn!("unlock timer expired; app lock is active again");
+                Ok(())
+            }
+            UnlockExpiryAction::WindowsLock => {
+                warn!("unlock timer expired; requesting Windows lock");
+                lock_active_console(pending.protected_user_sid.as_deref())
+            }
+            UnlockExpiryAction::Shutdown => {
+                warn!("unlock timer expired; requesting system shutdown");
+                shutdown_machine()
+            }
+        }
     }
 
     pub fn lock_active_console(expected_sid: Option<&str>) -> std::io::Result<()> {

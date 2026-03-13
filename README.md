@@ -26,7 +26,8 @@ This repository already includes:
   - `POST /api/device/unlock`
   - `POST /api/device/extend`
   - `POST /api/device/lock`
-  - `POST /api/service/stop`
+  - `POST /api/device/windows-lock`
+  - `POST /api/device/shutdown`
   - `GET /healthz`
 - named-pipe IPC contract for `GetState`, `Heartbeat`, and `LocalUnlock`
 - Windows-only service/agent entrypoints with non-Windows stubs so the workspace still builds on macOS
@@ -77,7 +78,8 @@ Example:
 
 - The service listens on `127.0.0.1:46391` by default.
 - Remaining time is owned by the service and persisted in `config.json`; the agent only renders the service state and sends heartbeats.
+- Parent unlock/extend requests can choose the timeout follow-up action: `app_lock`, `windows_lock`, or `shutdown`.
+- Parent controls can also immediately apply `App Lock`, `Windows Lock`, or `Windows Shutdown` without waiting for the timer.
 - The service supervisor relaunches the agent for the active console session when heartbeats go stale, and the install script configures Windows Service recovery to restart the service after unexpected termination.
-- For intentional maintenance stops, use `scripts/stop-service.ps1` so the service asks for the parent PIN before shutting down.
 - The Windows-specific code paths were not executed in this macOS workspace. Only the shared/core and non-Windows build paths were tested here with `cargo test`.
 - The current agent implementation uses one topmost window across the full virtual desktop, which covers multi-monitor setups through the virtual screen bounds.

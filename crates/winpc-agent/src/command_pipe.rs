@@ -92,18 +92,19 @@ mod imp {
         }
 
         unsafe {
-            let screen_dc = GetDC(HWND::default());
-            if screen_dc.0 == 0 {
+            let desktop = Some(HWND::default());
+            let screen_dc = GetDC(desktop);
+            if screen_dc == Default::default() {
                 return Err(last_os_error_message());
             }
 
-            let memory_dc = CreateCompatibleDC(screen_dc);
-            if memory_dc.0 == 0 {
-                let _ = ReleaseDC(HWND::default(), screen_dc);
+            let memory_dc = CreateCompatibleDC(Some(screen_dc));
+            if memory_dc == Default::default() {
+                let _ = ReleaseDC(desktop, screen_dc);
                 return Err(last_os_error_message());
             }
 
-            let mut bitmap_info = BITMAPINFO {
+            let bitmap_info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,
                     biWidth: width,
@@ -117,34 +118,46 @@ mod imp {
             };
             let mut raw_bits = std::ptr::null_mut();
             let bitmap = CreateDIBSection(
-                screen_dc,
+                Some(screen_dc),
                 &bitmap_info,
                 DIB_RGB_COLORS,
                 &mut raw_bits,
                 None,
                 0,
-            );
-            if bitmap.0 == 0 || raw_bits.is_null() {
+            )
+            .map_err(|error| error.to_string())?;
+            if raw_bits.is_null() {
                 let _ = DeleteDC(memory_dc);
-                let _ = ReleaseDC(HWND::default(), screen_dc);
+                let _ = ReleaseDC(desktop, screen_dc);
                 return Err(last_os_error_message());
             }
 
             let previous = SelectObject(memory_dc, bitmap.into());
-            if previous.0 == 0 {
+            if previous == HGDIOBJ::default() {
                 let _ = DeleteObject(bitmap.into());
                 let _ = DeleteDC(memory_dc);
-                let _ = ReleaseDC(HWND::default(), screen_dc);
+                let _ = ReleaseDC(desktop, screen_dc);
                 return Err(last_os_error_message());
             }
 
             let raster = ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0);
-            let copied = BitBlt(memory_dc, 0, 0, width, height, screen_dc, x, y, raster).as_bool();
-            if !copied {
+            if BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                x,
+                y,
+                raster,
+            )
+            .is_err()
+            {
                 let _ = SelectObject(memory_dc, previous);
                 let _ = DeleteObject(bitmap.into());
                 let _ = DeleteDC(memory_dc);
-                let _ = ReleaseDC(HWND::default(), screen_dc);
+                let _ = ReleaseDC(desktop, screen_dc);
                 return Err(last_os_error_message());
             }
 
@@ -161,7 +174,7 @@ mod imp {
             let _ = SelectObject(memory_dc, previous);
             let _ = DeleteObject(bitmap.into());
             let _ = DeleteDC(memory_dc);
-            let _ = ReleaseDC(HWND::default(), screen_dc);
+            let _ = ReleaseDC(desktop, screen_dc);
 
             encode_png(width as u32, height as u32, &rgba)
         }
