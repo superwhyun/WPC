@@ -21,9 +21,12 @@ mod windows_app {
         Win32::{
             Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM},
             Graphics::Gdi::{
-                CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-                DEFAULT_PITCH, FF_MODERN, FF_SWISS, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
-                FW_BOLD, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, COLOR_WINDOW,
+                CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, 
+                DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, FF_MODERN, FF_SWISS, 
+                FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FW_BOLD, FW_NORMAL, 
+                GetDC, HBRUSH, HFONT, HDC, OUT_DEFAULT_PRECIS, 
+                ReleaseDC, SetBkMode, SetTextColor, TRANSPARENT,
+                COLOR_WINDOW,
             },
             System::{
                 LibraryLoader::GetModuleHandleW,
@@ -34,14 +37,16 @@ mod windows_app {
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
                 GetClientRect, GetDlgItem, GetMessageW, GetSystemMetrics, GetWindowRect,
                 GetWindowTextLengthW, GetWindowTextW, LoadCursorW, PostMessageW, PostQuitMessage,
-                RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
-                SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON,
-                ES_CENTER, ES_PASSWORD, HMENU, HTCAPTION, HWND_TOPMOST, IDC_ARROW, MSG,
-                SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_MOVE,
-                WM_NCHITTEST, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_VISIBLE,
+                RegisterClassW, SendMessageW, SetForegroundWindow,
+                SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, 
+                TranslateMessage, BS_PUSHBUTTON, ES_CENTER, ES_PASSWORD, HMENU, HTCAPTION, 
+                HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN, 
+                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, 
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, 
+                WM_DESTROY, WM_ERASEBKGND, WM_MOVE, WM_NCHITTEST, WM_SETFONT, 
+                WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_TOOLWINDOW, 
+                WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
             },
         },
     };
@@ -51,6 +56,7 @@ mod windows_app {
     const WINDOW_CLASS: &str = "WinParentalControlAgentWindow";
     const TIMER_ID: usize = 1;
     const SERVICE_DISCONNECT_FAILURES_BEFORE_EXIT: usize = 2;
+    
     const WM_SERVICE_DISCONNECTED: u32 = WM_APP + 1;
     const WM_RESTORE_EXISTING_INSTANCE: u32 = WM_APP + 2;
     const ID_PIN_EDIT: i32 = 2001;
@@ -63,11 +69,15 @@ mod windows_app {
     const ID_EXPIRY_ACTION_BUTTON: i32 = 2008;
     const ID_TIMER_PIN_EDIT: i32 = 2009;
     const ID_TIMER_EXTEND_BUTTON: i32 = 2010;
-    const WARN_ONLY_WIDTH: i32 = 560;
-    const WARN_ONLY_HEIGHT: i32 = 430;
-    const TIMER_WIDGET_WIDTH: i32 = 360;
-    const TIMER_WIDGET_HEIGHT: i32 = 240;
-    const TIMER_WIDGET_MARGIN: i32 = 28;
+    
+    // Lock screen dimensions
+    const LOCK_CARD_WIDTH: i32 = 420;
+    const LOCK_CARD_HEIGHT: i32 = 520;
+    
+    // Timer widget - compact metallic design
+    const TIMER_WIDGET_WIDTH: i32 = 200;
+    const TIMER_WIDGET_HEIGHT: i32 = 60;
+    const TIMER_WIDGET_MARGIN: i32 = 16;
 
     static UI_STATE: OnceLock<Arc<Mutex<UiState>>> = OnceLock::new();
 
@@ -178,7 +188,7 @@ mod windows_app {
         match action {
             UnlockExpiryAction::AppLock => "App lock",
             UnlockExpiryAction::WindowsLock => "Windows lock",
-            UnlockExpiryAction::Shutdown => "Windows shutdown",
+            UnlockExpiryAction::Shutdown => "Shutdown",
         }
     }
 
@@ -233,6 +243,19 @@ mod windows_app {
                 DEFAULT_PITCH.0 as u32 | family,
                 face,
             )
+        }
+    }
+
+    fn set_control_colors(hwnd: HWND, text_color: u32, bg_transparent: bool) {
+        unsafe {
+            let hdc = GetDC(Some(hwnd));
+            if !hdc.is_invalid() {
+                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(text_color));
+                if bg_transparent {
+                    SetBkMode(hdc, TRANSPARENT);
+                }
+                ReleaseDC(Some(hwnd), hdc);
+            }
         }
     }
 
@@ -295,31 +318,28 @@ mod windows_app {
         };
 
         unsafe { RegisterClassW(&class) };
+        
         let (style, ex_style, x, y, width, height) = if let Some(state) = UI_STATE.get() {
             let guard = state.lock().unwrap();
             let is_timer_widget = timer_widget_mode(&guard.status);
             if guard.status.warn_only {
+                // Warn mode - regular window with border
                 (
                     WS_OVERLAPPED | WS_VISIBLE,
                     WINDOW_EX_STYLE::default(),
-                    40,
-                    40,
-                    WARN_ONLY_WIDTH,
-                    WARN_ONLY_HEIGHT,
+                    40, 40, 480, 360,
                 )
             } else if is_timer_widget {
-                // Unlocked 상태: Timer Widget으로 시작
+                // Unlocked: Compact metallic widget, no title bar, no border
                 let (default_x, default_y) = default_timer_widget_position();
                 (
-                    WS_VISIBLE,
+                    WS_POPUP | WS_VISIBLE,
                     WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-                    default_x,
-                    default_y,
-                    TIMER_WIDGET_WIDTH,
-                    TIMER_WIDGET_HEIGHT,
+                    default_x, default_y,
+                    TIMER_WIDGET_WIDTH, TIMER_WIDGET_HEIGHT,
                 )
             } else {
-                // Locked 상태: 전체 화면
+                // Locked: Fullscreen, no decorations
                 (
                     WS_VISIBLE,
                     WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -346,14 +366,8 @@ mod windows_app {
                 PCWSTR(class_name.as_ptr()),
                 w!("WinParentalControl"),
                 style,
-                x,
-                y,
-                width,
-                height,
-                None,
-                None,
-                Some(instance.into()),
-                None,
+                x, y, width, height,
+                None, None, Some(instance.into()), None,
             )
         }
         .map_err(|error| error.to_string())?;
@@ -406,17 +420,13 @@ mod windows_app {
                             .unwrap_or(ui.selected_expiry_action);
                         ui.message = if ui.status.mode == DeviceMode::Locked && ui.status.warn_only
                         {
-                            "Test mode: lock would be active now, but enforcement is disabled."
-                                .to_string()
+                            "Test mode: lock would be active".to_string()
                         } else if ui.status.mode == DeviceMode::Locked {
-                            "Locked. Parent PIN required.".to_string()
+                            "Enter PIN to unlock".to_string()
                         } else if ui.status.warn_only {
-                            format!(
-                                "Test mode active. {} remaining until lock resumes.",
-                                countdown_text(&ui.status)
-                            )
+                            format!("Test: {} remaining", countdown_text(&ui.status))
                         } else {
-                            "Unlocked by parent.".to_string()
+                            countdown_text(&ui.status)
                         };
                     }
                     (Ok(IpcResponse::Ack(status)), _) => {
@@ -432,11 +442,11 @@ mod windows_app {
                             .status
                             .unlock_expiry_action
                             .unwrap_or(ui.selected_expiry_action);
-                        ui.message = "Service heartbeat failed; keeping screen locked.".to_string();
+                        ui.message = "Service issue - locked".to_string();
                     }
                     (Err(error), _) | (_, Err(error)) => {
                         ui.status.mode = DeviceMode::Locked;
-                        ui.message = format!("Service unavailable: {error}");
+                        ui.message = format!("Service: {error}");
                     }
                     (_, Ok(IpcResponse::Error { message })) => {
                         ui.status.mode = DeviceMode::Locked;
@@ -524,6 +534,31 @@ mod windows_app {
                 refresh_ui();
                 LRESULT(0)
             }
+            WM_ERASEBKGND => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let mut rect = RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
+                    let is_timer = UI_STATE
+                        .get()
+                        .map(|state| timer_widget_mode(&state.lock().unwrap().status))
+                        .unwrap_or(false);
+                    
+                    let color = if is_timer {
+                        // Metallic silver-gray for timer widget - brighter
+                        0x404050
+                    } else {
+                        // Dark for lock screen
+                        0x0f1115
+                    };
+                    
+                    let brush = unsafe { windows::Win32::Graphics::Gdi::CreateSolidBrush(
+                        windows::Win32::Foundation::COLORREF(color)
+                    ) };
+                    unsafe { windows::Win32::Graphics::Gdi::FillRect(hdc, &rect, brush) };
+                    unsafe { let _ = DeleteObject(brush.into()); };
+                }
+                LRESULT(1)
+            }
             WM_SIZE => {
                 layout_controls(hwnd);
                 LRESULT(0)
@@ -577,192 +612,168 @@ mod windows_app {
     }
 
     fn create_controls(hwnd: HWND) {
-        let title_font = create_font(-30, FW_BOLD.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
-        let timer_font = create_font(-54, FW_BOLD.0 as i32, FF_MODERN.0 as u32, w!("Consolas"));
-        let body_font = create_font(-20, FW_NORMAL.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
+        // Clean, modern fonts
+        let title_font = create_font(-26, FW_BOLD.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
+        let timer_font = create_font(-42, FW_BOLD.0 as i32, FF_MODERN.0 as u32, w!("Consolas"));
+        let body_font = create_font(-18, FW_NORMAL.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
+        let small_font = create_font(-13, FW_NORMAL.0 as i32, FF_SWISS.0 as u32, w!("Segoe UI"));
 
+        // Title - centered, clean
         let title = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("CONTROL ACTIVE"),
+                w!("🔒 Locked"),
                 static_center_style(),
-                0,
-                0,
-                100,
-                40,
+                0, 0, 100, 36,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_TITLE_LABEL)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // Timer display - big and clear
         let timer = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
                 w!("00:00"),
                 static_center_style(),
-                0,
-                0,
-                100,
-                72,
+                0, 0, 100, 56,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_TIMER_LABEL)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // Status hint
         let hint = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Use the timer as your guide. Extend time or lock instantly."),
+                w!("Enter your PIN to unlock"),
                 static_center_style(),
-                0,
-                0,
-                100,
-                40,
+                0, 0, 100, 24,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_HINT_LABEL)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // PIN input - clean white box
         let pin = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("EDIT"),
                 w!(""),
                 child_style(WS_BORDER.0 | ES_CENTER as u32 | ES_PASSWORD as u32),
-                0,
-                0,
-                100,
-                40,
+                0, 0, 100, 40,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_PIN_EDIT)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // Duration input
         let duration = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("EDIT"),
                 w!("30"),
                 child_style(WS_BORDER.0 | ES_CENTER as u32),
-                0,
-                0,
-                100,
-                40,
+                0, 0, 100, 36,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_DURATION_EDIT)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // Expiry action button
         let expiry_action = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 PCWSTR(wide(&expiry_action_button_text(UnlockExpiryAction::AppLock)).as_ptr()),
                 child_style(BS_PUSHBUTTON as u32),
-                0,
-                0,
-                100,
-                40,
+                0, 0, 100, 36,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_EXPIRY_ACTION_BUTTON)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // Unlock button
         let button = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 w!("Unlock"),
                 child_style(BS_PUSHBUTTON as u32),
-                0,
-                0,
-                100,
-                40,
+                0, 0, 100, 42,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_UNLOCK_BUTTON)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
+        // Message/status area
         let message = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Waiting for service sync..."),
+                w!(""),
                 static_center_style(),
-                0,
-                0,
-                100,
-                72,
+                0, 0, 100, 40,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_MESSAGE_LABEL)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
 
+        // Timer widget controls (hidden in lock mode)
         let timer_pin = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("EDIT"),
                 w!(""),
                 child_style(WS_BORDER.0 | ES_CENTER as u32 | ES_PASSWORD as u32),
-                0,
-                0,
-                100,
-                32,
+                0, 0, 100, 28,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_TIMER_PIN_EDIT)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
+        
         let timer_extend_button = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
-                w!("+30 min"),
+                w!("+30m"),
                 child_style(BS_PUSHBUTTON as u32),
-                0,
-                0,
-                100,
-                32,
+                0, 0, 60, 28,
                 Some(hwnd),
                 Some(hmenu_from_id(ID_TIMER_EXTEND_BUTTON)),
-                None,
-                None,
+                None, None,
             )
-        }
-        .unwrap();
+        }.unwrap();
 
+        // Apply fonts
         apply_font(title, title_font);
         apply_font(timer, timer_font);
-        apply_font(hint, body_font);
+        apply_font(hint, small_font);
         apply_font(pin, body_font);
         apply_font(duration, body_font);
-        apply_font(expiry_action, body_font);
+        apply_font(expiry_action, small_font);
         apply_font(button, body_font);
-        apply_font(message, body_font);
-        apply_font(timer_pin, body_font);
-        apply_font(timer_extend_button, body_font);
+        apply_font(message, small_font);
+        apply_font(timer_pin, small_font);
+        apply_font(timer_extend_button, small_font);
+        
+        // Set colors for dark theme
+        set_control_colors(title, 0xffffff, true);
+        set_control_colors(timer, 0x4dabf7, true);  // Cyan for timer
+        set_control_colors(hint, 0x94a3b8, true);
+        set_control_colors(message, 0xffffff, true);  // White for message
 
         if let Some(state) = UI_STATE.get() {
             let mut guard = state.lock().unwrap();
@@ -788,50 +799,69 @@ mod windows_app {
         unsafe { GetClientRect(hwnd, &mut rect) }.unwrap();
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
-        let compact_timer = UI_STATE
+        let is_unlock = UI_STATE
             .get()
             .map(|state| timer_widget_mode(&state.lock().unwrap().status))
             .unwrap_or(false);
 
-        if compact_timer {
-            // Unlock 상태: 시간 표시와 메시지만, 시간 추가 UI는 제거
-            move_control(ID_TIMER_LABEL, 12, 16, width - 24, 72);
-            move_control(ID_MESSAGE_LABEL, 12, 92, width - 24, 40);
-            // PIN 입력과 Extend 버튼은 숨김 처리됨 (아래 set_control_visible에서)
+        if is_unlock {
+            // === UNLOCK MODE: Compact metallic widget ===
+            // No title bar, minimal padding, metallic border effect
+            
+            // Center the timer text vertically, left-aligned with padding
+            move_control(ID_TIMER_LABEL, 12, 8, 90, 44);
+            // Small status text on right
+            move_control(ID_MESSAGE_LABEL, 100, 22, 92, 20);
+            
+            // Hide all lock mode controls
+            set_control_visible_by_id(ID_TITLE_LABEL, false);
+            set_control_visible_by_id(ID_HINT_LABEL, false);
+            set_control_visible_by_id(ID_PIN_EDIT, false);
+            set_control_visible_by_id(ID_DURATION_EDIT, false);
+            set_control_visible_by_id(ID_EXPIRY_ACTION_BUTTON, false);
+            set_control_visible_by_id(ID_UNLOCK_BUTTON, false);
+            set_control_visible_by_id(ID_TIMER_PIN_EDIT, false);
+            set_control_visible_by_id(ID_TIMER_EXTEND_BUTTON, false);
+            set_control_visible_by_id(ID_TIMER_LABEL, true);
+            set_control_visible_by_id(ID_MESSAGE_LABEL, true);
             return;
         }
 
-        let center_x = width / 2;
-        let top = height / 2 - 180;
-        let panel_width = 460;
-        let left = center_x - panel_width / 2;
-
-        move_control(ID_TITLE_LABEL, left, top, panel_width, 40);
-        move_control(ID_TIMER_LABEL, left, top + 46, panel_width, 86);
-        move_control(ID_HINT_LABEL, left, top + 136, panel_width, 34);
-        move_control(ID_MESSAGE_LABEL, left + 24, top + 176, panel_width - 48, 60);
-        move_control(ID_PIN_EDIT, left + 50, top + 252, panel_width - 100, 38);
-        move_control(
-            ID_DURATION_EDIT,
-            left + 50,
-            top + 298,
-            panel_width - 100,
-            38,
-        );
-        move_control(
-            ID_EXPIRY_ACTION_BUTTON,
-            left + 50,
-            top + 344,
-            panel_width - 100,
-            38,
-        );
-        move_control(
-            ID_UNLOCK_BUTTON,
-            left + 50,
-            top + 390,
-            panel_width - 100,
-            44,
-        );
+        // === LOCK MODE: Clean centered card ===
+        let card_width = LOCK_CARD_WIDTH;
+        let card_height = LOCK_CARD_HEIGHT;
+        let card_x = (width - card_width) / 2;
+        let card_y = (height - card_height) / 2;
+        
+        let content_x = card_x + 40;
+        let content_width = card_width - 80;
+        
+        // Vertical layout with good spacing
+        move_control(ID_TITLE_LABEL, content_x, card_y + 40, content_width, 36);
+        move_control(ID_TIMER_LABEL, content_x, card_y + 90, content_width, 56);
+        move_control(ID_HINT_LABEL, content_x, card_y + 155, content_width, 24);
+        move_control(ID_MESSAGE_LABEL, content_x, card_y + 185, content_width, 36);
+        move_control(ID_PIN_EDIT, content_x + 40, card_y + 230, content_width - 80, 40);
+        
+        // Side by side: duration and action
+        let half_width = (content_width - 90) / 2;
+        move_control(ID_DURATION_EDIT, content_x + 40, card_y + 280, half_width, 36);
+        move_control(ID_EXPIRY_ACTION_BUTTON, content_x + 50 + half_width, card_y + 280, half_width, 36);
+        
+        // Unlock button - prominent
+        move_control(ID_UNLOCK_BUTTON, content_x + 40, card_y + 335, content_width - 80, 44);
+        
+        // Show lock controls, hide timer widget controls
+        set_control_visible_by_id(ID_TITLE_LABEL, true);
+        set_control_visible_by_id(ID_HINT_LABEL, true);
+        set_control_visible_by_id(ID_PIN_EDIT, true);
+        set_control_visible_by_id(ID_DURATION_EDIT, true);
+        set_control_visible_by_id(ID_EXPIRY_ACTION_BUTTON, true);
+        set_control_visible_by_id(ID_UNLOCK_BUTTON, true);
+        set_control_visible_by_id(ID_MESSAGE_LABEL, true);
+        set_control_visible_by_id(ID_TIMER_LABEL, true);
+        set_control_visible_by_id(ID_TIMER_PIN_EDIT, false);
+        set_control_visible_by_id(ID_TIMER_EXTEND_BUTTON, false);
     }
 
     fn move_control(id: i32, x: i32, y: i32, width: i32, height: i32) {
@@ -843,16 +873,19 @@ mod windows_app {
         }
     }
 
-    fn set_control_visible(hwnd: HWND, visible: bool) {
-        unsafe {
-            let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+    fn set_control_visible_by_id(id: i32, visible: bool) {
+        if let Some(state) = UI_STATE.get() {
+            let hwnd = hwnd_from_raw(state.lock().unwrap().hwnd);
+            if let Ok(child) = unsafe { GetDlgItem(Some(hwnd), id) } {
+                unsafe {
+                    let _ = ShowWindow(child, if visible { SW_SHOW } else { SW_HIDE });
+                }
+            }
         }
     }
 
     fn remember_timer_widget_position(hwnd: HWND) {
-        let Some(state) = UI_STATE.get() else {
-            return;
-        };
+        let Some(state) = UI_STATE.get() else { return; };
         let mut rect = RECT::default();
         if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
             return;
@@ -867,9 +900,7 @@ mod windows_app {
     }
 
     fn handle_unlock() {
-        let Some(state) = UI_STATE.get() else {
-            return;
-        };
+        let Some(state) = UI_STATE.get() else { return; };
         let (pin_hwnd, duration_hwnd, expiry_action) = {
             let guard = state.lock().unwrap();
             (
@@ -894,7 +925,7 @@ mod windows_app {
         match result {
             Ok(IpcResponse::Ack(status)) => {
                 guard.status = status;
-                guard.message = "Unlocked locally.".to_string();
+                guard.message = "Unlocked".to_string();
                 drop(guard);
                 refresh_ui();
             }
@@ -911,9 +942,7 @@ mod windows_app {
     }
 
     fn handle_extend() {
-        let Some(state) = UI_STATE.get() else {
-            return;
-        };
+        let Some(state) = UI_STATE.get() else { return; };
         let (timer_pin_hwnd, expiry_action) = {
             let guard = state.lock().unwrap();
             (
@@ -925,9 +954,7 @@ mod windows_app {
         let pin = read_control_text(timer_pin_hwnd);
         if pin.is_empty() {
             let mut guard = state.lock().unwrap();
-            guard.message = "PIN required to extend time.".to_string();
-            drop(guard);
-            refresh_ui();
+            guard.message = "PIN required".to_string();
             return;
         }
 
@@ -941,13 +968,10 @@ mod windows_app {
         match result {
             Ok(IpcResponse::Ack(status)) => {
                 guard.status = status;
-                guard.message = "Time extended by 30 minutes.".to_string();
-                // PIN 필드 비우기
+                guard.message = "+30 min".to_string();
                 unsafe {
                     SetWindowTextW(hwnd_from_raw(guard.timer_pin_hwnd), w!("")).ok();
                 }
-                drop(guard);
-                refresh_ui();
             }
             Ok(IpcResponse::Error { message }) => {
                 guard.message = message;
@@ -960,15 +984,11 @@ mod windows_app {
     }
 
     fn cycle_expiry_action() {
-        let Some(state) = UI_STATE.get() else {
-            return;
-        };
-
+        let Some(state) = UI_STATE.get() else { return; };
         {
             let mut guard = state.lock().unwrap();
             guard.selected_expiry_action = next_expiry_action(guard.selected_expiry_action);
         }
-
         refresh_ui();
     }
 
@@ -985,15 +1005,12 @@ mod windows_app {
     }
 
     fn refresh_ui() {
-        let Some(state) = UI_STATE.get() else {
-            return;
-        };
+        let Some(state) = UI_STATE.get() else { return; };
 
         {
             let mut guard = state.lock().unwrap();
             if timer_widget_mode(&guard.status) && !guard.timer_widget_position_set {
                 let (x, y) = default_timer_widget_position();
-                eprintln!("[DEBUG] Setting timer widget position: ({}, {})", x, y);
                 guard.timer_widget_x = x;
                 guard.timer_widget_y = y;
                 guard.timer_widget_position_set = true;
@@ -1006,13 +1023,13 @@ mod windows_app {
             title_hwnd,
             timer_hwnd,
             hint_hwnd,
-            pin_hwnd,
-            duration_hwnd,
+            _pin_hwnd,
+            _duration_hwnd,
             expiry_action_hwnd,
-            button_hwnd,
+            _button_hwnd,
             message_hwnd,
-            timer_pin_hwnd,
-            timer_extend_button_hwnd,
+            _timer_pin_hwnd,
+            _timer_extend_button_hwnd,
             hwnd,
             was_visible,
             selected_expiry_action,
@@ -1041,99 +1058,51 @@ mod windows_app {
             )
         };
 
-        let compact_timer = timer_widget_mode(&status);
+        let is_unlock = timer_widget_mode(&status);
         let countdown = countdown_text(&status);
         let selected_expiry_action = status
             .unlock_expiry_action
             .unwrap_or(selected_expiry_action);
-        let title = match status.mode {
-            DeviceMode::Locked if status.warn_only => "TEST MODE".to_string(),
-            DeviceMode::Locked => "SCREEN LOCKED".to_string(),
-            DeviceMode::Unlocked if status.warn_only => "TEST WINDOW ACTIVE".to_string(),
-            DeviceMode::Unlocked => "ACCESS GRANTED".to_string(),
+        
+        let title = if status.mode == DeviceMode::Locked {
+            if status.warn_only { "🔓 Test Mode" } else { "🔒 Locked" }
+        } else {
+            "✓ Unlocked"
         };
 
-        let hint = format!(
-            "{}  |  Agent {}  |  Session {}",
-            if status.warn_only {
-                "Warn-only mode"
-            } else {
-                "Lock enforced"
-            },
-            if status.agent_healthy {
-                "healthy"
-            } else {
-                "stale"
-            },
-            if status.protected_user_logged_in {
-                "online"
-            } else {
-                "offline"
-            }
-        );
-        let timer = match status.mode {
-            DeviceMode::Unlocked => countdown.clone(),
-            DeviceMode::Locked if status.warn_only => "LOCKED".to_string(),
-            DeviceMode::Locked => "00:00".to_string(),
+        let hint = if status.mode == DeviceMode::Locked {
+            "Enter PIN to unlock"
+        } else {
+            "Time remaining"
         };
-        let timeout_action = format!(
-            "On timeout: {}",
-            expiry_action_label(selected_expiry_action)
-        );
-        let detail = match status.mode {
-            DeviceMode::Unlocked if status.warn_only => format!("{}", timeout_action),
-            DeviceMode::Unlocked => timeout_action.clone(),
-            DeviceMode::Locked if status.warn_only => {
-                "Lock would be enforced now, but warn-only mode keeps this as a visible preview."
-                    .to_string()
-            }
-            DeviceMode::Locked => format!(
-                "Parent PIN and duration are required. Current timeout action: {}.",
-                expiry_action_label(selected_expiry_action)
-            ),
-        };
-        let title_wide = wide(&title);
-        let timer_wide = wide(&timer);
-        let hint_wide = wide(&hint);
-        let expiry_action_wide = wide(&expiry_action_button_text(selected_expiry_action));
-        let message_text = if compact_timer {
-            timeout_action
+        
+        let timer_text = if is_unlock { countdown.clone() } else { "--:--".to_string() };
+        let timeout_action = format!("On timeout: {}", expiry_action_label(selected_expiry_action));
+        
+        let message_text = if is_unlock {
+            countdown
         } else if message.is_empty() {
-            detail
+            timeout_action
         } else {
             message
         };
-        let message_wide = wide(&message_text);
-        unsafe {
-            SetWindowTextW(title_hwnd, PCWSTR(title_wide.as_ptr())).unwrap();
-            SetWindowTextW(timer_hwnd, PCWSTR(timer_wide.as_ptr())).unwrap();
-            SetWindowTextW(hint_hwnd, PCWSTR(hint_wide.as_ptr())).unwrap();
-            SetWindowTextW(expiry_action_hwnd, PCWSTR(expiry_action_wide.as_ptr())).unwrap();
-            SetWindowTextW(message_hwnd, PCWSTR(message_wide.as_ptr())).unwrap();
-        }
 
-        set_control_visible(title_hwnd, !compact_timer);
-        set_control_visible(hint_hwnd, !compact_timer);
-        set_control_visible(pin_hwnd, !compact_timer);
-        set_control_visible(duration_hwnd, !compact_timer);
-        set_control_visible(expiry_action_hwnd, !compact_timer);
-        set_control_visible(button_hwnd, !compact_timer);
-        set_control_visible(timer_hwnd, true);
-        set_control_visible(message_hwnd, true);
-        // Unlock 상태에서도 시간 추가 UI는 숨김 (웹 UI에서만 조작)
-        set_control_visible(timer_pin_hwnd, false);
-        set_control_visible(timer_extend_button_hwnd, false);
+        unsafe {
+            SetWindowTextW(title_hwnd, PCWSTR(wide(title).as_ptr())).unwrap();
+            SetWindowTextW(timer_hwnd, PCWSTR(wide(&timer_text).as_ptr())).unwrap();
+            SetWindowTextW(hint_hwnd, PCWSTR(wide(hint).as_ptr())).unwrap();
+            SetWindowTextW(expiry_action_hwnd, PCWSTR(wide(&expiry_action_button_text(selected_expiry_action)).as_ptr())).unwrap();
+            SetWindowTextW(message_hwnd, PCWSTR(wide(&message_text).as_ptr())).unwrap();
+        }
 
         let mut is_visible = was_visible;
         if !is_visible {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-            }
+            unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
             is_visible = true;
         }
 
         // Determine target view mode
-        let target_mode = if compact_timer {
+        let target_mode = if is_unlock {
             ViewMode::TimerWidget
         } else if status.warn_only {
             ViewMode::WarnOnly
@@ -1141,8 +1110,7 @@ mod windows_app {
             ViewMode::FullscreenLock
         };
 
-        // Lock 상태에서는 항상 전체 화면으로 초기화
-        // Unlock 상태에서는 모드 변경 시에만 위치 조정 (사용자 위치 유지)
+        // Check if we need to reposition/resize
         let should_reposition = if target_mode == ViewMode::FullscreenLock {
             true
         } else if let Some(state) = UI_STATE.get() {
@@ -1157,52 +1125,42 @@ mod windows_app {
                 ViewMode::TimerWidget => {
                     unsafe {
                         SetWindowPos(
-                            hwnd,
-                            Some(HWND_TOPMOST),
-                            timer_widget_x,
-                            timer_widget_y,
-                            TIMER_WIDGET_WIDTH,
-                            TIMER_WIDGET_HEIGHT,
+                            hwnd, Some(HWND_TOPMOST),
+                            timer_widget_x, timer_widget_y,
+                            TIMER_WIDGET_WIDTH, TIMER_WIDGET_HEIGHT,
                             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-                        )
-                        .unwrap();
+                        ).unwrap();
                     }
                 }
                 ViewMode::WarnOnly => {
                     unsafe {
                         SetWindowPos(
-                            hwnd,
-                            None,
-                            40,
-                            40,
-                            WARN_ONLY_WIDTH,
-                            WARN_ONLY_HEIGHT,
+                            hwnd, None, 40, 40, 480, 360,
                             SWP_SHOWWINDOW,
-                        )
-                        .unwrap();
+                        ).unwrap();
                     }
                 }
                 ViewMode::FullscreenLock => {
                     unsafe {
                         SetWindowPos(
-                            hwnd,
-                            Some(HWND_TOPMOST),
+                            hwnd, Some(HWND_TOPMOST),
                             GetSystemMetrics(SM_XVIRTUALSCREEN),
                             GetSystemMetrics(SM_YVIRTUALSCREEN),
                             GetSystemMetrics(SM_CXVIRTUALSCREEN),
                             GetSystemMetrics(SM_CYVIRTUALSCREEN),
                             SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                        )
-                        .unwrap();
+                        ).unwrap();
                         let _ = SetForegroundWindow(hwnd);
                     }
                 }
             }
 
-            // Update current view mode
             if let Some(state) = UI_STATE.get() {
                 state.lock().unwrap().current_view_mode = Some(target_mode);
             }
+            
+            // Force re-layout after mode change
+            layout_controls(hwnd);
         }
 
         if is_visible != was_visible {
